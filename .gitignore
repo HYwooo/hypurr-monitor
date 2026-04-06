@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.eggs/
+*.egg-info/
+*.egg
+.ruff_cache/
+.opencode/
+.mypy_cache/
+
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Logs
+*.log
+debug.log
+
+# Config
+config.toml
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Build
+dist/
+build/
+*.whl
+
+# Misc
+*.tmp
+*.temp
+.hypothesis/
+AGENTS.md

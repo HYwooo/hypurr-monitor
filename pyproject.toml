@@ -1,0 +1,53 @@
+[project]
+name = "hypurr-monitor"
+version = "0.1.0"
+description = "Hyperliquid real-time monitoring system"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "numpy>=2.0.0",
+    "ta-lib>=0.4.0",
+    "toml>=0.10.0",
+    "watchdog>=4.0.0",
+    "coincurve>=21.0.0",
+    "orjson>=3.9.0",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.0",
+    "pytest-asyncio>=1.0.0",
+    "mypy>=1.20.0",
+    "ruff>=0.15.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+markers = [
+    "integration: marks tests as integration (require live network, may be flaky)",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disable_error_code = ["untyped-decorator", "type-arg"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "DTZ", "ISC", "ICN", "PIE", "T20", "PYI", "RSE", "RET", "SLF", "SIM", "ARG", "PTH", "ERA", "PL", "TRY", "RUF"]
+ignore = ["E501", "T201", "TRY300", "RET505"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004", "SLF001", "ARG001", "TRY002", "TRY003"]
