@@ -1,6 +1,7 @@
 """Tests for signal detection module - price comparisons and state machines."""
 
 import time
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -102,7 +103,7 @@ class TestCheckSignals:
         """During initialization, should not send signals."""
         mark_prices: dict[str, float] = {"BTC": 50000.0}
         mark_price_times: dict[str, float] = {"BTC": time.time()}
-        benchmark: dict[str, dict] = {
+        benchmark: dict[str, dict[str, Any]] = {
             "BTC": {
                 "st1": 49000.0,
                 "st2": 48000.0,
@@ -110,10 +111,10 @@ class TestCheckSignals:
                 "atr1h_lower": 49000.0,
             }
         }
-        trailing_stop: dict = {}
-        last_atr_state: dict = {}
-        last_alert_time: dict = {}
-        last_st_state: dict = {}
+        trailing_stop: dict[str, Any] = {}
+        last_atr_state: dict[str, Any] = {}
+        last_alert_time: dict[str, Any] = {}
+        last_st_state: dict[str, Any] = {}
 
         await check_signals(
             "BTC",
@@ -141,7 +142,7 @@ class TestCheckSignals:
         """Price breaks above ATR upper should trigger LONG."""
         mark_prices: dict[str, float] = {"BTC": 52000.0}
         mark_price_times: dict[str, float] = {"BTC": time.time()}
-        benchmark: dict[str, dict] = {
+        benchmark: dict[str, dict[str, Any]] = {
             "BTC": {
                 "st1": 49000.0,
                 "st2": 48000.0,
@@ -149,10 +150,10 @@ class TestCheckSignals:
                 "atr1h_lower": 49000.0,
             }
         }
-        trailing_stop: dict = {}
-        last_atr_state: dict = {}
-        last_alert_time: dict = {}
-        last_st_state: dict = {}
+        trailing_stop: dict[str, Any] = {}
+        last_atr_state: dict[str, Any] = {}
+        last_alert_time: dict[str, Any] = {}
+        last_st_state: dict[str, Any] = {}
 
         await check_signals(
             "BTC",
@@ -182,7 +183,7 @@ class TestCheckSignals:
         """Price breaks below ATR lower should trigger SHORT."""
         mark_prices: dict[str, float] = {"BTC": 48000.0}
         mark_price_times: dict[str, float] = {"BTC": time.time()}
-        benchmark: dict[str, dict] = {
+        benchmark: dict[str, dict[str, Any]] = {
             "BTC": {
                 "st1": 49000.0,
                 "st2": 48000.0,
@@ -190,10 +191,10 @@ class TestCheckSignals:
                 "atr1h_lower": 49000.0,
             }
         }
-        trailing_stop: dict = {}
-        last_atr_state: dict = {"BTC": {"ch": 0}}
-        last_alert_time: dict = {}
-        last_st_state: dict = {}
+        trailing_stop: dict[str, Any] = {}
+        last_atr_state: dict[str, Any] = {"BTC": {"ch": 0}}
+        last_alert_time: dict[str, Any] = {}
+        last_st_state: dict[str, Any] = {}
 
         await check_signals(
             "BTC",
@@ -223,7 +224,7 @@ class TestCheckSignals:
         """Already in LONG state, price above upper should NOT trigger again."""
         mark_prices: dict[str, float] = {"BTC": 52000.0}
         mark_price_times: dict[str, float] = {"BTC": time.time()}
-        benchmark: dict[str, dict] = {
+        benchmark: dict[str, dict[str, Any]] = {
             "BTC": {
                 "st1": 49000.0,
                 "st2": 48000.0,
@@ -231,10 +232,10 @@ class TestCheckSignals:
                 "atr1h_lower": 49000.0,
             }
         }
-        trailing_stop: dict = {}
-        last_atr_state: dict = {"BTC": {"ch": 1, "sent": "LONG"}}
-        last_alert_time: dict = {}
-        last_st_state: dict = {}
+        trailing_stop: dict[str, Any] = {}
+        last_atr_state: dict[str, Any] = {"BTC": {"ch": 1, "sent": "LONG"}}
+        last_alert_time: dict[str, Any] = {}
+        last_st_state: dict[str, Any] = {}
 
         await check_signals(
             "BTC",
@@ -262,7 +263,7 @@ class TestCheckSignals:
         """Stale price (> 300s old) should not trigger signals."""
         mark_prices: dict[str, float] = {"BTC": 52000.0}
         mark_price_times: dict[str, float] = {"BTC": time.time() - 400}
-        benchmark: dict[str, dict] = {
+        benchmark: dict[str, dict[str, Any]] = {
             "BTC": {
                 "st1": 49000.0,
                 "st2": 48000.0,
@@ -270,10 +271,10 @@ class TestCheckSignals:
                 "atr1h_lower": 49000.0,
             }
         }
-        trailing_stop: dict = {}
-        last_atr_state: dict = {}
-        last_alert_time: dict = {}
-        last_st_state: dict = {}
+        trailing_stop: dict[str, Any] = {}
+        last_atr_state: dict[str, Any] = {}
+        last_alert_time: dict[str, Any] = {}
+        last_st_state: dict[str, Any] = {}
 
         await check_signals(
             "BTC",
@@ -301,11 +302,11 @@ class TestCheckSignals:
         """Symbol not in benchmark should return early."""
         mark_prices: dict[str, float] = {"BTC": 50000.0}
         mark_price_times: dict[str, float] = {"BTC": time.time()}
-        benchmark: dict[str, dict] = {}
-        trailing_stop: dict = {}
-        last_atr_state: dict = {}
-        last_alert_time: dict = {}
-        last_st_state: dict = {}
+        benchmark: dict[str, dict[str, Any]] = {}
+        trailing_stop: dict[str, Any] = {}
+        last_atr_state: dict[str, Any] = {}
+        last_alert_time: dict[str, Any] = {}
+        last_st_state: dict[str, Any] = {}
 
         await check_signals(
             "BTC",
@@ -335,7 +336,7 @@ class TestCheckSignals:
         """Signal should establish trailing stop state."""
         mark_prices: dict[str, float] = {"BTC": 52000.0}
         mark_price_times: dict[str, float] = {"BTC": time.time()}
-        benchmark: dict[str, dict] = {
+        benchmark: dict[str, dict[str, Any]] = {
             "BTC": {
                 "st1": 49000.0,
                 "st2": 48000.0,
@@ -343,10 +344,10 @@ class TestCheckSignals:
                 "atr1h_lower": 49000.0,
             }
         }
-        trailing_stop: dict = {}
-        last_atr_state: dict = {}
-        last_alert_time: dict = {}
-        last_st_state: dict = {}
+        trailing_stop: dict[str, Any] = {}
+        last_atr_state: dict[str, Any] = {}
+        last_alert_time: dict[str, Any] = {}
+        last_st_state: dict[str, Any] = {}
 
         await check_signals(
             "BTC",
@@ -388,14 +389,14 @@ class TestCheckTrailingStop:
     @pytest.mark.asyncio
     async def test_no_signal_inactive_trailing_stop(self, mock_webhook: AsyncMock, mock_increment: MagicMock) -> None:
         """Inactive trailing stop should not trigger."""
-        trailing_stop: dict = {"BTC": {"direction": "LONG", "active": False}}
+        trailing_stop: dict[str, Any] = {"BTC": {"direction": "LONG", "active": False}}
         await check_trailing_stop("BTC", 50000.0, trailing_stop, mock_webhook, mock_increment)
         mock_webhook.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_long_stop_triggered(self, mock_webhook: AsyncMock, mock_increment: MagicMock) -> None:
         """LONG trailing stop triggered when price < lower band."""
-        trailing_stop: dict = {
+        trailing_stop: dict[str, Any] = {
             "BTC": {
                 "direction": "LONG",
                 "entry_price": 50000.0,
@@ -412,7 +413,7 @@ class TestCheckTrailingStop:
     @pytest.mark.asyncio
     async def test_short_stop_triggered(self, mock_webhook: AsyncMock, mock_increment: MagicMock) -> None:
         """SHORT trailing stop triggered when price > upper band."""
-        trailing_stop: dict = {
+        trailing_stop: dict[str, Any] = {
             "BTC": {
                 "direction": "SHORT",
                 "entry_price": 50000.0,
@@ -427,7 +428,7 @@ class TestCheckTrailingStop:
     @pytest.mark.asyncio
     async def test_stop_deactivated_after_trigger(self, mock_webhook: AsyncMock, mock_increment: MagicMock) -> None:
         """Trailing stop should be deactivated after triggering."""
-        trailing_stop: dict = {
+        trailing_stop: dict[str, Any] = {
             "BTC": {
                 "direction": "LONG",
                 "entry_price": 50000.0,
@@ -442,7 +443,7 @@ class TestCheckTrailingStop:
     @pytest.mark.asyncio
     async def test_zero_price_returns_early(self) -> None:
         """Zero price should return immediately."""
-        trailing_stop: dict = {"BTC": {"direction": "LONG", "active": True}}
+        trailing_stop: dict[str, Any] = {"BTC": {"direction": "LONG", "active": True}}
         mock_webhook = AsyncMock()
         mock_increment = MagicMock()
         await check_trailing_stop("BTC", 0.0, trailing_stop, mock_webhook, mock_increment)
@@ -451,7 +452,7 @@ class TestCheckTrailingStop:
     @pytest.mark.asyncio
     async def test_clustering_ts_stop(self, mock_webhook: AsyncMock, mock_increment: MagicMock) -> None:
         """Clustering TS trailing stop uses clustering_ts line."""
-        trailing_stop: dict = {
+        trailing_stop: dict[str, Any] = {
             "BTC": {
                 "direction": "LONG",
                 "entry_price": 50000.0,
@@ -470,8 +471,8 @@ class TestRecalculateStates:
     @pytest.mark.asyncio
     async def test_insufficient_klines(self) -> None:
         """Less than MIN_KLINES should return early."""
-        kline_cache: dict = {"BTC": [[1, 2, 3, 4, 5, 6]] * 50}
-        benchmark: dict = {}
+        kline_cache: dict[str, Any] = {"BTC": [[1, 2, 3, 4, 5, 6]] * 50}
+        benchmark: dict[str, Any] = {}
         await recalculate_states(
             "BTC",
             kline_cache,
@@ -512,7 +513,7 @@ class TestRecalculateStates:
             for i in range(n)
         ]
         kline_cache: dict[str, list[Kline]] = {"BTC": klines}
-        benchmark: dict = {}
+        benchmark: dict[str, Any] = {}
         await recalculate_states(
             "BTC",
             kline_cache,
@@ -546,8 +547,8 @@ class TestUpdateKlines:
     @pytest.mark.asyncio
     async def test_update_klines_creates_client_on_error(self) -> None:
         """Should handle errors gracefully."""
-        kline_cache: dict = {}
-        last_kline_time: dict = {}
+        kline_cache: dict[str, Any] = {}
+        last_kline_time: dict[str, Any] = {}
 
         async def false_is_pair(_sym: str) -> bool:
             return False

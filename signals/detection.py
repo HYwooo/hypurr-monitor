@@ -123,17 +123,21 @@ async def fetch_pair_klines(  # noqa: PLR0913, PLR0912
             continue
         k2 = k2_by_time[t]
         o1, c1 = float(k1.open), float(k1.close)
+        h1, l1 = float(k1.high), float(k1.low)
         o2, c2 = float(k2.open), float(k2.close)
-        if o2 == 0 or c2 == 0:
+        h2, l2 = float(k2.high), float(k2.low)
+        if o2 == 0 or c2 == 0 or h2 == 0 or l2 == 0:
             continue
         ratio_o = o1 / o2
         ratio_c = c1 / c2
+        ratio_h = h1 / ((h2 + l2) / 2)
+        ratio_l = l1 / ((h2 + l2) / 2)
         merged.append(
             [
                 t,
                 ratio_o,
-                max(ratio_o, ratio_c),
-                min(ratio_o, ratio_c),
+                max(ratio_o, ratio_c, ratio_h),
+                min(ratio_o, ratio_c, ratio_l),
                 ratio_c,
                 float(k1.volume),
             ]
@@ -141,7 +145,7 @@ async def fetch_pair_klines(  # noqa: PLR0913, PLR0912
     return sorted(merged, key=lambda x: x[0])
 
 
-async def update_klines(  # noqa: PLR0913
+async def update_klines(  # noqa: PLR0913, PLR0912
     symbol: str,
     kline_cache: dict[str, Any],
     last_kline_time: dict[str, Any],
@@ -168,7 +172,7 @@ async def update_klines(  # noqa: PLR0913
         recalculate_states_clustering_fn: Async callback for PAIR Clustering recalculation (optional)
         exchange_id: Exchange ID (deprecated, unused)
     """
-    with suppress(Exception):
+    try:
         is_pair = is_pair_trading_fn(symbol)
         if is_pair:
             klines = await (fetch_pair_klines_fn or fetch_pair_klines)(
@@ -177,30 +181,47 @@ async def update_klines(  # noqa: PLR0913
                 fetch_klines_fn=fetch_klines_fn,
                 exchange_id=exchange_id,
             )
+            if klines:
+                kline_cache[symbol] = klines
+                last_time = last_kline_time.get(symbol, 0)
+                new_time = int(klines[-1].open_time)
+                if new_time > last_time:
+                    last_kline_time[symbol] = new_time
+                    if recalculate_states_clustering_fn:
+                        await recalculate_states_clustering_fn(symbol)
         else:
-            if fetch_klines_fn:
+            from hyperliquid.rest_client import (
+                get_cached_klines,
+                update_cache,
+            )
+
+            interval = "1h"
+            cached = get_cached_klines(symbol, interval)
+            if cached and len(cached) >= 200:  # noqa: PLR2004
+                klines = cached
+                logger.debug(f"[update_klines] {symbol} cache hit, using {len(klines)} cached klines")
+            elif fetch_klines_fn:
                 klines = await fetch_klines_fn(symbol, proxy=proxy)
             else:
                 from hyperliquid.rest_client import HyperliquidREST
 
                 client = HyperliquidREST(proxy=proxy)
                 try:
-                    klines = await client.fetch_klines(symbol, interval="1h", limit=500)
+                    klines = await client.fetch_klines(symbol, interval=interval, limit=500)
                 finally:
                     await client.close()
-            if klines and symbol not in kline_cache:
+                if klines:
+                    update_cache(symbol, interval, klines)
+            if klines:
                 kline_cache[symbol] = klines
-        if klines:
-            if is_pair:
-                kline_cache[symbol] = klines
-            last_time = last_kline_time.get(symbol, 0)
-            new_time = int(klines[-1].open_time)
-            if new_time > last_time:
-                last_kline_time[symbol] = new_time
-                if is_pair and recalculate_states_clustering_fn:
-                    await recalculate_states_clustering_fn(symbol)
-                elif recalculate_states_fn:
-                    await recalculate_states_fn(symbol)
+                last_time = last_kline_time.get(symbol, 0)
+                new_time = int(klines[-1].open_time)
+                if new_time > last_time:
+                    last_kline_time[symbol] = new_time
+                    if recalculate_states_fn:
+                        await recalculate_states_fn(symbol)
+    except Exception:
+        logger.warning(f"[update_klines] {symbol} fetch failed or timeout, skipping")
 
 
 async def recalculate_states(  # noqa: PLR0913

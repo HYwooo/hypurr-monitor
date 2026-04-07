@@ -12,9 +12,9 @@ import logging
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-import toml
+import toml  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ def load_config(config_path: str) -> dict[str, Any]:
     if not Path(config_path).exists():
         msg = f"Config file not found: {config_path}"
         raise FileNotFoundError(msg)
-    return toml.load(config_path)
+    return cast(dict[str, Any], toml.load(config_path))
 
 
 def save_config(config_path: str, config: dict[str, Any]) -> None:

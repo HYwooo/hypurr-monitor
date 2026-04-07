@@ -7,14 +7,20 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import aiohttp
 import numpy as np
 import orjson
-import toml
+import toml  # type: ignore[import-untyped]
 
-from hyperliquid.rest_client import HyperliquidREST
+from hyperliquid.rest_client import (
+    HyperliquidREST,
+    fetch_meta,
+    get_cached_klines,
+    get_price_decimals,
+    update_cache,
+)
 from indicators import (
     calculate_atr,
     run_atr_channel,
@@ -153,7 +159,7 @@ class NotificationService:
         """Load config from TOML file."""
         if not Path(config_path).exists():
             raise FileNotFoundError("Config file not found")  # noqa: TRY003
-        return toml.load(config_path)
+        return cast(dict[str, Any], toml.load(config_path))
 
     def _increment_alert_count(self) -> None:
         """Increment alert count thread-safely."""
@@ -385,6 +391,31 @@ class NotificationService:
             self._increment_alert_count,
         )
 
+    async def _get_component_klines(
+        self,
+        sym: str,
+        interval: str,
+        limit: int,
+        proxy: str | None,
+        kline_cache: dict[str, Any] | None,
+    ) -> list[Kline]:
+        """Get klines for a component symbol, checking global cache first."""
+        _min_klines = 200
+        cached = get_cached_klines(sym, interval)
+        if cached and len(cached) >= _min_klines:
+            return cached
+        local: list[Kline] | None = kline_cache.get(sym) if kline_cache else None
+        if local and len(local) >= _min_klines:
+            return local
+        client = HyperliquidREST(proxy=proxy)
+        try:
+            klines = await client.fetch_klines(sym, interval=interval, limit=limit)
+        finally:
+            await client.close()
+        if klines:
+            update_cache(sym, interval, klines)
+        return klines
+
     async def _hl_fetch_klines(self, symbol: str, proxy: str | None = None) -> list[Kline]:
         """Fetch K-lines using native Hyperliquid REST API."""
         client = HyperliquidREST(proxy=proxy)
@@ -408,26 +439,15 @@ class NotificationService:
             return []
         sym1, sym2 = pair[0], pair[1]
 
-        cached1 = kline_cache.get(sym1) if kline_cache else None
-        cached2 = kline_cache.get(sym2) if kline_cache else None
-
-        if cached1 and cached2:
-            klines1, klines2 = cached1, cached2
-        else:
-            client = HyperliquidREST(proxy=proxy)
-            try:
-                klines1 = await client.fetch_klines(sym1, interval=interval, limit=limit)
-                klines2 = await client.fetch_klines(sym2, interval=interval, limit=limit)
-            finally:
-                await client.close()
-            if kline_cache is not None:
-                if klines1:
-                    kline_cache[sym1] = klines1
-                if klines2:
-                    kline_cache[sym2] = klines2
+        klines1 = await self._get_component_klines(sym1, interval, limit, proxy, kline_cache)
+        klines2 = await self._get_component_klines(sym2, interval, limit, proxy, kline_cache)
 
         if not klines1 or not klines2:
             return []
+
+        if kline_cache is not None:
+            kline_cache[sym1] = klines1
+            kline_cache[sym2] = klines2
 
         k2_by_time = {int(k.open_time): k for k in klines2}
         merged: list[Kline] = []
@@ -437,19 +457,23 @@ class NotificationService:
                 continue
             k2 = k2_by_time[t]
             o1, c1 = float(k1.open), float(k1.close)
+            h1, l1 = float(k1.high), float(k1.low)
             o2, c2 = float(k2.open), float(k2.close)
-            if o2 == 0 or c2 == 0:
+            h2, l2 = float(k2.high), float(k2.low)
+            if o2 == 0 or c2 == 0 or h2 == 0 or l2 == 0:
                 continue
-            ratio_o = round(o1 / o2, 4)
-            ratio_c = round(c1 / c2, 4)
+            ratio_o = o1 / o2
+            ratio_c = c1 / c2
+            ratio_h = h1 / ((h2 + l2) / 2)
+            ratio_l = l1 / ((h2 + l2) / 2)
             merged.append(
                 Kline(
                     symbol=symbol,
                     interval=interval,
                     open_time=t,
                     open=ratio_o,
-                    high=max(ratio_o, ratio_c),
-                    low=min(ratio_o, ratio_c),
+                    high=max(ratio_o, ratio_c, ratio_h),
+                    low=min(ratio_o, ratio_c, ratio_l),
                     close=ratio_c,
                     volume=float(k1.volume),
                     close_time=int(k1.close_time) if k1.close_time else 0,
@@ -580,6 +604,8 @@ class NotificationService:
         logger.info(f"Initializing klines for {len(self.symbols)} symbols...")
         self._initialized = False
 
+        await fetch_meta(proxy=self.proxy_url if self.proxy_enable else None)
+
         for symbol in self.single_list:
             await self._ct_update_klines(symbol)
             klines = self.kline_cache.get(symbol, [])
@@ -638,12 +664,10 @@ class NotificationService:
         if price > 0 and atr_natrr > 0:
             natr = (atr_natrr / price) * 100
             logger.info(
-                f"[{symbol}] Price={price:.4f} | ATR_Ch={atr_dir} | Range=[{atr_lower:.4f}, {atr_upper:.4f}] | NATR20={natr:.2f}%"
+                f"[{symbol}] {atr_dir}@{price:.4f} | ATR_Ch[{atr_upper:.4f}, {atr_lower:.4f}] | NATR {natr:.2f}%"
             )
         else:
-            logger.info(
-                f"[{symbol}] Price={price:.4f} | ATR_Ch={atr_dir} | Range=[{atr_lower:.4f}, {atr_upper:.4f}] | NATR20=N/A"
-            )
+            logger.info(f"[{symbol}] {atr_dir}@{price:.4f} | ATR_Ch[{atr_upper:.4f}, {atr_lower:.4f}] | NATR N/A")
 
     async def _send_initial_state_summary(self) -> None:
         """Send initial state summary for all symbols after initialization."""
@@ -674,23 +698,25 @@ class NotificationService:
                 )
                 continue
 
+            pd_val = get_price_decimals(sym)
+
             if price > 0 and atr_natrr > 0:
                 natr = (atr_natrr / price) * 100
-                natr_str = f"NATR20={natr:.2f}%"
+                natr_str = f"NATR {natr:.2f}%"
             else:
-                natr_str = "NATR20=N/A"
+                natr_str = "NATR N/A"
 
             if is_pair:
                 st_state = self.last_st_state.get(sym, "neutral")
                 lines.append(
-                    f"{sym}: {atr_dir} | 价格: {price:.4f} | ATR通道: 上轨{atr_upper:.4f} 下轨{atr_lower:.4f} | {natr_str} | ST:{st_state}"
+                    f"{sym} | {atr_dir}@{price:.{pd_val}f} | ATR_Ch[{atr_upper:.{pd_val}f}, {atr_lower:.{pd_val}f}] | {natr_str} | ST:{st_state}"
                 )
             else:
                 lines.append(
-                    f"{sym}: {atr_dir} | 价格: {price:.4f} | ATR通道: 上轨{atr_upper:.4f} 下轨{atr_lower:.4f} | {natr_str}"
+                    f"{sym} | {atr_dir}@{price:.{pd_val}f} | ATR_Ch[{atr_upper:.{pd_val}f}, {atr_lower:.{pd_val}f}] | {natr_str}"
                 )
 
-        msg = "初始化完成, 当前状态:\n" + "\n".join(lines)
+        msg = "READY | " + " | ".join(lines)
         await self._send_webhook("SYSTEM", msg)
 
     async def run(self) -> None:

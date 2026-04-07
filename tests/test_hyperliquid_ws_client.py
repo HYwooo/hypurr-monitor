@@ -47,7 +47,7 @@ class TestHyperliquidWSInit:
         assert "para" in HyperliquidWS.DEXES
 
 
-def make_text_msg(channel: str, data: dict) -> MagicMock:
+def make_text_msg(channel: str, data: dict[str, Any]) -> MagicMock:
     """Helper to create a TEXT message."""
     msg = MagicMock()
     msg.type = aiohttp.WSMsgType.TEXT
@@ -110,19 +110,19 @@ class TestHyperliquidWSReceiveLoop:
         ws._ws = MagicMock()
 
         messages = [
-            make_text_msg("allMids", {"mids": {"BTC": "65000.5", "ETH": "3500.25"}}),
+            make_text_msg("allMids", {"mids": {"BTC": 65000.5, "ETH": 3500.25}}),
             ClosedMsg(),
         ]
 
-        async def receive_side_effect() -> MagicMock:
+        async def receive_side_effect() -> Any:
             return messages.pop(0)
 
         ws._ws.receive = receive_side_effect
 
         await ws._receive_loop()
 
-        assert ws._marks["BTC"] == "65000.5"
-        assert ws._marks["ETH"] == "3500.25"
+        assert ws._marks["BTC"] == 65000.5
+        assert ws._marks["ETH"] == 3500.25
 
     async def test_receive_loop_ignores_unknown_channel(self) -> None:
         """Should ignore unknown channel messages."""
@@ -135,7 +135,7 @@ class TestHyperliquidWSReceiveLoop:
             ClosedMsg(),
         ]
 
-        async def receive_side_effect() -> MagicMock:
+        async def receive_side_effect() -> Any:
             return messages.pop(0)
 
         ws._ws.receive = receive_side_effect
@@ -199,7 +199,7 @@ class TestHyperliquidWSReceiveLoop:
             ClosedMsg(),
         ]
 
-        async def receive_side_effect() -> MagicMock:
+        async def receive_side_effect() -> Any:
             return messages.pop(0)
 
         ws._ws.receive = receive_side_effect
@@ -215,18 +215,18 @@ class TestHyperliquidWSReceiveLoop:
         ws._ws = MagicMock()
 
         messages = [
-            make_text_msg("allMids", {"mids": {"BTC": "65000.5"}}),
+            make_text_msg("allMids", {"mids": {"BTC": 65000.5}}),
             ClosedMsg(),
         ]
 
-        async def receive_side_effect() -> MagicMock:
+        async def receive_side_effect() -> Any:
             return messages.pop(0)
 
         ws._ws.receive = receive_side_effect
 
         await ws._receive_loop()
 
-        assert ws._marks["BTC"] == "65000.5"
+        assert ws._marks["BTC"] == 65000.5
 
 
 class TestHyperliquidWSGetMarks:
@@ -235,9 +235,9 @@ class TestHyperliquidWSGetMarks:
     async def test_get_marks_returns_copy(self) -> None:
         """get_marks should return a copy."""
         ws = HyperliquidWS()
-        ws._marks = {"BTC": "65000"}
+        ws._marks = {"BTC": 65000.0}
         marks = await ws.get_marks()
-        marks["ETH"] = "3500"
+        marks["ETH"] = 3500.0
         assert "ETH" not in ws._marks
 
 

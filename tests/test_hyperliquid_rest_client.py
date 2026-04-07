@@ -122,7 +122,7 @@ class TestHyperliquidRESTFetchKlines:
     async def test_fetch_klines_empty_response(self) -> None:
         """Empty list response returns empty klines."""
         client = HyperliquidREST()
-        client._post = AsyncMock(return_value=[])
+        client._post = AsyncMock(return_value=[])  # type: ignore[method-assign]
         result = await client.fetch_klines("BTC", limit=10)
         assert result == []
 
@@ -135,12 +135,12 @@ class TestHyperliquidRESTFetchKlines:
         async def raise_429(*args: Any, **kwargs: Any) -> None:
             raise ClientResponseError(
                 request_info=MagicMock(),
-                history=[],
+                history=(),
                 status=429,
                 message="Too Many Requests",
             )
 
-        client._post = AsyncMock(side_effect=raise_429)
+        client._post = AsyncMock(side_effect=raise_429)  # type: ignore[method-assign]
         with pytest.raises(ClientResponseError) as exc_info:
             await client.fetch_klines("BTC", limit=10)
         assert exc_info.value.status == 429
@@ -148,14 +148,14 @@ class TestHyperliquidRESTFetchKlines:
     async def test_fetch_klines_network_error(self) -> None:
         """Network error should raise."""
         client = HyperliquidREST()
-        client._post = AsyncMock(side_effect=OSError("Connection refused"))
+        client._post = AsyncMock(side_effect=OSError("Connection refused"))  # type: ignore[method-assign]
         with pytest.raises(OSError, match="Connection refused"):
             await client.fetch_klines("BTC", limit=10)
 
     async def test_fetch_klines_timeout(self) -> None:
         """Timeout should raise."""
         client = HyperliquidREST()
-        client._post = AsyncMock(side_effect=TimeoutError("Request timed out"))
+        client._post = AsyncMock(side_effect=TimeoutError("Request timed out"))  # type: ignore[method-assign]
         with pytest.raises(TimeoutError):
             await client.fetch_klines("BTC", limit=10)
 
@@ -168,12 +168,12 @@ class TestHyperliquidRESTFetchKlines:
         async def raise_500(*args: Any, **kwargs: Any) -> None:
             raise ClientResponseError(
                 request_info=MagicMock(),
-                history=[],
+                history=(),
                 status=500,
                 message="Internal Server Error",
             )
 
-        client._post = AsyncMock(side_effect=raise_500)
+        client._post = AsyncMock(side_effect=raise_500)  # type: ignore[method-assign]
         with pytest.raises(ClientResponseError) as exc_info:
             await client.fetch_klines("BTC", limit=10)
         assert exc_info.value.status == 500
@@ -185,14 +185,14 @@ class TestHyperliquidRESTFetchKlines:
         async def bad_json(*args: Any, **kwargs: Any) -> Any:
             raise ValueError("Expecting value")
 
-        client._post = AsyncMock(side_effect=bad_json)
+        client._post = AsyncMock(side_effect=bad_json)  # type: ignore[method-assign]
         with pytest.raises(ValueError):
             await client.fetch_klines("BTC", limit=10)
 
     async def test_fetch_klines_non_list_response(self) -> None:
         """Non-list response treated as empty."""
         client = HyperliquidREST()
-        client._post = AsyncMock(return_value={"error": "something went wrong"})
+        client._post = AsyncMock(return_value={"error": "something went wrong"})  # type: ignore[method-assign]
         result = await client.fetch_klines("BTC", limit=10)
         assert result == []
 
@@ -204,7 +204,7 @@ class TestHyperliquidRESTFetchKlines:
             {"t": now_ms - 3600000, "o": "65000", "h": "66000", "l": "64000", "c": "65500", "v": "100"},
             {"t": now_ms, "o": "65500", "h": "66500", "l": "64500", "c": "66000", "v": "150"},
         ]
-        client._post = AsyncMock(return_value=mock_data)
+        client._post = AsyncMock(return_value=mock_data)  # type: ignore[method-assign]
         result = await client.fetch_klines("BTC", interval="1h", limit=500)
         assert len(result) == 2
         assert result[0].open == 65000.0
@@ -212,22 +212,22 @@ class TestHyperliquidRESTFetchKlines:
         assert result[1].high == 66500.0
 
     async def test_fetch_klines_pagination(self) -> None:
-        """Pagination works when more than 500 candles."""
+        """Pagination works when more than 2000 candles."""
         client = HyperliquidREST()
         now_ms = 1704067200000
 
         batch1 = [
             {"t": now_ms - 3600000 * i, "o": "65000", "h": "66000", "l": "64000", "c": "65500", "v": "100"}
-            for i in range(500)
+            for i in range(2000)
         ]
         batch2 = [
-            {"t": now_ms - 3600000 * (500 + i), "o": "65000", "h": "66000", "l": "64000", "c": "65500", "v": "100"}
-            for i in range(100)
+            {"t": now_ms - 3600000 * (2000 + i), "o": "65000", "h": "66000", "l": "64000", "c": "65500", "v": "100"}
+            for i in range(500)
         ]
 
-        client._post = AsyncMock(side_effect=[batch1, batch2])
-        result = await client.fetch_klines("BTC", interval="1h", limit=600)
-        assert len(result) == 600
+        client._post = AsyncMock(side_effect=[batch1, batch2])  # type: ignore[method-assign]
+        result = await client.fetch_klines("BTC", interval="1h", limit=2500)
+        assert len(result) == 2500
         assert client._post.call_count == 2
 
     async def test_fetch_klines_xyz_gold(self) -> None:
@@ -237,7 +237,7 @@ class TestHyperliquidRESTFetchKlines:
         mock_data = [
             {"t": now_ms - 3600000, "o": "2000", "h": "2100", "l": "1950", "c": "2050", "v": "50"},
         ]
-        client._post = AsyncMock(return_value=mock_data)
+        client._post = AsyncMock(return_value=mock_data)  # type: ignore[method-assign]
         result = await client.fetch_klines("xyz:GOLD", interval="1h", limit=10)
         assert len(result) == 1
         assert result[0].symbol == "xyz:GOLD"

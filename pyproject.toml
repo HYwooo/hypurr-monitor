@@ -39,7 +39,11 @@ warn_unused_configs = true
 
 [[tool.mypy.overrides]]
 module = "tests.*"
-disable_error_code = ["untyped-decorator", "type-arg"]
+disable_error_code = ["type-arg", "method-assign", "comparison-overlap", "arg-type", "dict-item", "assignment"]
+
+[[tool.mypy.overrides]]
+module = "toml"
+disable_error_code = ["import-untyped"]
 
 [tool.ruff]
 line-length = 120

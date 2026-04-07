@@ -1,5 +1,7 @@
 """Tests for data models."""
 
+from typing import Any
+
 import pytest
 
 from models import Kline, PairState, Ticker
@@ -48,7 +50,7 @@ class TestKline:
 
     def test_from_ws_with_defaults(self) -> None:
         """WS data with missing fields defaults to 0."""
-        data: dict = {}
+        data: dict[str, Any] = {}
         kline = Kline.from_ws("BTCUSDT", "1h", data)
         assert kline.open == 0.0
         assert kline.high == 0.0
