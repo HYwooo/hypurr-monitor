@@ -37,13 +37,15 @@ hypurr-monitor/
 ```bash
 uv venv .venv
 source .venv/Scripts/activate  # Windows
-# uv sync
-uv pip install -r requirements.txt
+uv sync
+# uv pip install -r requirements.txt
 ```
 
 ## Usage
 
 ```bash
+# 运行监控系统
+uv run python main.py 
 # 默认运行（INFO level）
 python main.py
 
