@@ -1,29 +1,30 @@
-# ccxt-monitor
+# hypurr-monitor
 
-Cryptocurrency real-time monitoring system with multi-exchange support (Binance Futures), featuring ATR Channel and Clustering SuperTrend indicators, WebSocket real-time data, and Feishu webhook alerts.
+Hyperliquid 实时监控系统，支持 ATR Channel、Clustering SuperTrend、WebSocket 实时行情（原生）、飞书 WebHook 推送。
 
 ## Features
 
-- **Multi-Exchange Support**: Binance Futures via CCXT library
-- **Real-Time Data**: WebSocket streaming for live market data
-- **Technical Indicators**: ATR Channel, Clustering SuperTrend, Supertrend, Vegas Tunnel
-- **Alert System**: Feishu webhook notifications
-- **Proxy Support**: HTTP/SOCKS proxy for REST and WebSocket
+- **Hyperliquid 原生 API**：REST + WebSocket（wss://api.hyperliquid.xyz/ws）
+- **实时数据**：WebSocket allMids 流获取 mark price
+- **技术指标**：ATR Channel、Clustering SuperTrend、Supertrend (双周期)、Vegas Tunnel
+- **交易模式**：单一交易对监控 + 配对交易监控（如 BTC-ETH 价差）
+- **告警系统**：飞书 WebHook 卡片推送
+- **代理支持**：HTTP/HTTPS 代理（REST + WebSocket 共用配置）
+- **高性能**：orjson、numpy/talib、K 线缓存、滑动窗口限速
 
 ## Architecture
 
 ```
-ccxt-monitor/
-├── config/          # Configuration management (TOML)
-├── indicators/      # Pure calculation functions
-├── models/          # Data models (Kline, Ticker, PairState)
-├── rest_api/        # CCXT REST client
-├── websocket/       # CCXT Pro WebSocket subscriptions
-├── signals/         # Signal detection logic
-├── notifications/    # Feishu webhook formatting
-├── candlesticks/    # Microservice interface
-├── service/         # Main NotificationService
-└── ui/              # Textual TUI (reserved)
+hypurr-monitor/
+├── config/          # 配置管理 (TOML)
+├── hyperliquid/     # Hyperliquid 原生 API（REST + WebSocket）
+├── indicators/      # 纯计算函数（talib/numpy）
+├── models/          # 数据模型（Kline、Ticker）
+├── signals/         # 信号检测逻辑（ATR Channel、Clustering SuperTrend）
+├── notifications/   # 飞书 WebHook 格式化
+├── candlesticks/    # K 线服务接口
+├── service/         # NotificationService 业务流程编排
+└── ui/              # Textual TUI（预留）
 ```
 
 ## Requirements
@@ -34,33 +35,38 @@ ccxt-monitor/
 ## Installation
 
 ```bash
-uv sync
-uv sync --group dev  # with dev dependencies
+uv venv .venv
+source .venv/Scripts/activate  # Windows
+# uv sync
+uv pip install -r requirements.txt
 ```
 
 ## Usage
 
 ```bash
-# Default run (INFO level)
-uv run python main.py
+# 默认运行（INFO level）
+python main.py
 
-# Debug mode
-uv run python main.py --debug
+# Debug 模式
+python main.py --debug
 
-# Add symbols
-uv run python main.py --add-symbol BTC/USDT:USD,ETH/USDT:USD
+# 带配置文件运行
+python main.py --config config.toml
 
-# List symbols
-uv run python main.py --list-symbols
+# 添加交易对
+python main.py --config config.toml --add-symbol BTC,ETH
 
-# Run in background (Linux)
-uv run python main.py --daemon
+# 列出交易对
+python main.py --config config.toml --list-symbols
 
-# Stop daemon
-uv run python main.py --stop
+# 后台运行（Linux/macOS）
+python main.py --daemon
 
-# Check status
-uv run python main.py --status
+# 停止后台进程
+python main.py --stop
+
+# 查看状态
+python main.py --status
 ```
 
 ## Configuration
@@ -68,102 +74,110 @@ uv run python main.py --status
 Create `config.toml`:
 
 ```toml
-[exchange]
-exchange_id = "binance"
-proxy_enable = false
-proxy_url = ""
-
 [webhook]
-webhook_url = "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
-webhook_format = "card"
+url = "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+format = "card"
 
 [symbols]
-single_list = ["BTCUSDT", "ETHUSDT"]
-pair_list = []
+single_list = ["BTC", "ETH", "SOL", "HYPE", "XAU"]
+pair_list = ["BTC-ETH"]
 
-[indicators]
-atr1h_period = 14
-atr1h_ma_type = "EMA"
-atr1h_mult = 3.0
-atr15m_period = 14
-atr15m_ma_type = "EMA"
-atr15m_mult = 2.0
-atr_channel_mult = 1.5
-supertrend_period = 10
-supertrend_mult = 3.0
-vegas_tunnel_ema_signal = 9
-vegas_tunnel_ema_upper = 144
-vegas_tunnel_ema_lower = 169
+[atr_1h]
+ma_type = "DEMA"
+period = 14
+mult = 1.618
+
+[atr_15m]
+ma_type = "HMA"
+period = 14
+mult = 1.3
+
+[supertrend]
+period1 = 9
+multiplier1 = 2.5
+period2 = 14
+multiplier2 = 1.7
+
+[vegas]
+ema_signal = 9
+ema_upper = 144
+ema_lower = 169
+
+[clustering_st]
+min_mult = 1.0
+max_mult = 5.0
+step = 0.5
+perf_alpha = 10.0
+from_cluster = "Best"
+max_iter = 1000
+history_klines = 500
 
 [clustering]
 enabled = false
 min_mult = 1.0
 max_mult = 5.0
 step = 0.5
-perf_alpha = 0.05
-from_cluster = "next"
-max_iter = 100
+perf_alpha = 10.0
+from_cluster = "Best"
+max_iter = 1000
 
 [trailing]
 enabled = true
 atr_mult = 2.0
 
-[breakout]
-enabled = true
-lookback = 20
-threshold = 0.02
+[service]
+heartbeat_file = "heartbeat"
+heartbeat_timeout = 120
 
-[system]
-timezone = "+08:00"
-log_retention_days = 7
-max_log_lines = 10000
-```
+[proxy]
+enable = false
+url = "http://127.0.0.1:7890"
 
-## Usage
+[report]
+enable = false
+times = ["08:00", "20:00"]
 
-```bash
-# Run with config
-python main.py --config config.toml
-
-# Run with debug logging
-python main.py --config config.toml --debug
-
-# Add symbols
-python main.py --config config.toml --add-symbol BTCUSDT,ETHUSDT
-
-# List symbols
-python main.py --config config.toml --list-symbols
+[settings]
+timezone = "Z"
+max_log_lines = 1000
 ```
 
 ## Indicators
 
 ### ATR Channel
-Trailing stop mechanism using ATR bands for dynamic support/resistance levels.
+基于 1h ATR 的动态支撑/阻力通道，突破上轨做多，突破下轨做空，带 15m ATR 追踪止损。
 
 ### Clustering SuperTrend
-K-Means clustering on SuperTrend performance factors to identify market regimes.
+K-Means 聚类分析 SuperTrend 多参数表现，动态选择最优参数组合，适用于配对交易。
 
-### Supertrend
-Classic Supertrend indicator using ATR for trend detection.
+### Supertrend (Dual Period)
+双周期 Supertrend（9+2.5 和 14+1.7），用于趋势确认。
 
 ### Vegas Tunnel
-Three EMA lines (signal, upper, lower) for trend confirmation.
+三线 EMA（signal=9, upper=144, lower=169），用于趋势过滤。
 
 ## Development
 
 ```bash
-# Run tests
-pytest -v
+# 运行测试
+pytest
 
-# Type checking
+# 类型检查
 mypy . --strict --ignore-missing-imports
 
-# Linting
+# 代码检查
 ruff check .
 
-# All checks
-ruff check . && mypy . --strict --ignore-missing-imports && pytest -v
+# 一键检查
+ruff check . && mypy . --strict --ignore-missing-imports && pytest
 ```
+
+## Hyperliquid API
+
+- **REST**: `https://api.hyperliquid.xyz/info`
+- **WebSocket**: `wss://api.hyperliquid.xyz/ws`
+- **限速**: 1200 weight/min，滑动窗口 + burst 控制
+- **文档**: https://hyperliquid.gitbook.io/hyperliquid-docs/
 
 ## Proxy Configuration
 
@@ -173,11 +187,11 @@ enable = true
 url = "http://127.0.0.1:7890"
 ```
 
-| Protocol | REST (httpProxy) | WebSocket (httpsProxy) |
-|----------|------------------|------------------------|
-| HTTP     | ok               | ok                     |
-| HTTPS    | ok               | ok                     |
-| SOCKS    | ok               | -                      |
+| Protocol | REST | WebSocket |
+|----------|------|-----------|
+| HTTP     | ok   | ok        |
+| HTTPS    | ok   | ok        |
+| SOCKS    | ok   | -         |
 
 ## License
 

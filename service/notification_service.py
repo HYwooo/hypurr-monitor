@@ -5,7 +5,7 @@ Main notification service - coordinates all modules, manages WebSocket and signa
 import asyncio
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -152,7 +152,12 @@ class NotificationService:
         if tz == "Z":
             return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
         if tz.startswith(("+", "-")):
-            return datetime.now(UTC).strftime(f"%Y-%m-%dT%H:%M:%S{tz}")
+            sign = 1 if tz[0] == "+" else -1
+            parts = tz[1:].split(":")
+            td = timedelta(hours=sign * int(parts[0]), minutes=sign * int(parts[1]))
+            tz_obj = timezone(td)
+            local_time = datetime.now(UTC).astimezone(tz_obj)
+            return local_time.strftime("%Y-%m-%dT%H:%M:%S%z")
         return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
     def _load_config(self, config_path: str) -> dict[str, Any]:
@@ -716,7 +721,7 @@ class NotificationService:
                     f"{sym} | {atr_dir}@{price:.{pd_val}f} | ATR_Ch[{atr_upper:.{pd_val}f}, {atr_lower:.{pd_val}f}] | {natr_str}"
                 )
 
-        msg = "READY | " + " | ".join(lines)
+        msg = "READY\n" + "\n".join(lines)
         await self._send_webhook("SYSTEM", msg)
 
     async def run(self) -> None:

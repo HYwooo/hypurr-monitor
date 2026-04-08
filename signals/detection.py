@@ -433,6 +433,7 @@ async def check_signals_impl(  # noqa: PLR0913
     now = time.time()
     atr1h_upper = bm.get("atr1h_upper", 0)
     atr1h_lower = bm.get("atr1h_lower", 0)
+    atr1h_natrr = bm.get("atr1h_natrr", 0)
     prev_atr_state = last_atr_state.get(symbol, {"ch": 0, "sent": None})
 
     if price_ge(current_price, atr1h_upper) and prev_atr_state["ch"] != 1:
@@ -440,6 +441,7 @@ async def check_signals_impl(  # noqa: PLR0913
         if now - last_alert > SIGNAL_COOLDOWN:
             last_alert_time[f"ATR_Ch_{symbol}"] = now
             last_atr_state[symbol] = {"ch": 1, "sent": "LONG"}
+            natr = (atr1h_natrr / current_price * 100) if current_price > 0 and atr1h_natrr > 0 else None
             await send_webhook_fn(
                 "ATR_Ch",
                 f"[{symbol}] LONG",
@@ -449,6 +451,7 @@ async def check_signals_impl(  # noqa: PLR0913
                     "price": format_number(current_price),
                     "atr_upper": format_number(atr1h_upper),
                     "atr_lower": format_number(atr1h_lower),
+                    "natr": natr,
                 },
             )
             increment_alert_count_fn()
@@ -468,6 +471,7 @@ async def check_signals_impl(  # noqa: PLR0913
         if now - last_alert > SIGNAL_COOLDOWN:
             last_alert_time[f"ATR_Ch_{symbol}"] = now
             last_atr_state[symbol] = {"ch": -1, "sent": "SHORT"}
+            natr = (atr1h_natrr / current_price * 100) if current_price > 0 and atr1h_natrr > 0 else None
             await send_webhook_fn(
                 "ATR_Ch",
                 f"[{symbol}] SHORT",
@@ -477,6 +481,7 @@ async def check_signals_impl(  # noqa: PLR0913
                     "price": format_number(current_price),
                     "atr_upper": format_number(atr1h_upper),
                     "atr_lower": format_number(atr1h_lower),
+                    "natr": natr,
                 },
             )
             increment_alert_count_fn()

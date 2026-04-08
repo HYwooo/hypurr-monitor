@@ -125,6 +125,14 @@ def build_feishu_card(  # noqa: PLR0912, PLR0915
                     "content": f"**ATR Channel:** {atr_lower} ~ {atr_upper}",
                 }
             )
+        natr = extra.get("natr")
+        if natr is not None and not is_trailing:
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": f"**NATR20:** {natr:.2f}%",
+                }
+            )
         if alert_type == "ClusterST":
             ts = extra.get("ts", "")
             perf_ama = extra.get("perf_ama", "")
@@ -146,7 +154,7 @@ def build_feishu_card(  # noqa: PLR0912, PLR0915
                 {"tag": "markdown", "content": f"**Trigger Time:** {timestamp}"},
             ]
         )
-        title = f"{emoji} {symbol}"
+        title = f"{emoji} <{symbol}> {direction.upper()}"
 
     # SYSTEM
     elif alert_type == "SYSTEM":
