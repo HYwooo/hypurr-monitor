@@ -49,7 +49,7 @@ def _rotate_webhook_log_if_needed(max_log_lines: int = 1000) -> None:
         _get_logger().warning(f"Log rotation failed: {e}")
 
 
-def build_feishu_card(  # noqa: PLR0912, PLR0915
+def build_feishu_card(  # noqa: PLR0912
     alert_type: str, message: str, extra: dict[str, Any] | None, timestamp: str
 ) -> dict[str, Any]:
     """
@@ -256,7 +256,7 @@ def build_feishu_card(  # noqa: PLR0912, PLR0915
     }
 
 
-async def send_webhook(  # noqa: PLR0913
+async def send_webhook(
     webhook_url: str,
     webhook_format: str,
     alert_type: str,

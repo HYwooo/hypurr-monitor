@@ -19,7 +19,17 @@ format = "card"  # 消息格式: card (卡片) 或 text (文本)
 #   HIP-3 perpetuals: xyz:GOLD, hyna:BTC, flx:TSLA, vntl:SPACEX, km:US500, cash:USA500
 #   Spot: spot:HYPE/USDC, spot:BTC/USDC
 single_list = ["BTC", "ETH", "SOL", "HYPE", "ZEC", "MON"]
-pair_list = []
+pair_list = [
+    # "BTC-ETH",        # BTC-ETH 价差交易对
+    # "BTC-xyz:GOLD",   # BTC 与 GOLD 的价差交易对
+    # "ETH-SOL",        # ETH-SOL 价差交易对
+]
+
+# 策略配置
+# 可用策略: "atr_channel" (ATR Channel Breakout), "clustering_st" (Clustering SuperTrend)
+# 单标的和配对交易可以使用不同策略，灵活配置
+single_strategy = "atr_channel"  # 单标的默认策略
+pair_strategy = "clustering_st"  # 配对交易默认策略
 
 # ------------------------------------------------------------
 # ATR Channel 指标配置 (1小时周期)
@@ -84,3 +94,82 @@ max_log_lines = 1000  # 日志最大行数
 disable_single_trailing = false  # 禁用单标的追踪止损
 disable_pair_trailing = false  # 禁用配对追踪止损
 exchange = "hyperliquid"  # 交易所: hyperliquid
+
+# ============================================================
+# ML 信号系统配置 (CatBoost + LSTM)
+# ============================================================
+
+# ------------------------------------------------------------
+# ML 数据配置
+# ------------------------------------------------------------
+[ml]
+enable = false  # 是否启用 ML 信号
+timeframe = "15m"  # K 线周期
+lookback_days = 730  # 历史数据回溯天数 (2年)
+model_path = "models/ml/"  # 预训练模型目录
+
+# ------------------------------------------------------------
+# ML 标注配置
+# ------------------------------------------------------------
+[ml.labeling]
+neutral_scale = 0.5  # 平的定义: |return| <= ATR * neutral_scale
+lookforward_bars = 1  # 向前看几根 K 线
+
+# ------------------------------------------------------------
+# ML 模型配置
+# ------------------------------------------------------------
+[ml.model]
+primary = "catboost"  # 主模型: catboost, lightgbm, xgboost
+use_lstm_residual = true  # 是否使用 LSTM 残差修正
+
+[ml.model.catboost]
+task_type = "GPU"  # GPU 或 CPU
+devices = "0"  # GPU 设备
+iterations = 2000  # 迭代次数
+learning_rate = 0.03  # 学习率
+depth = 6  # 树深度
+l2_leaf_reg = 3  # L2 正则化
+
+[ml.model.lightgbm]
+device = "gpu"  # gpu 或 cpu
+num_iterations = 2000
+learning_rate = 0.03
+max_depth = 6
+
+[ml.model.xgboost]
+device = "cuda"  # cuda 或 cpu
+n_estimators = 2000
+learning_rate = 0.03
+max_depth = 6
+
+[ml.model.lstm]
+seq_len = 10  # 序列长度
+hidden_size = 64  # LSTM 隐藏层大小
+epochs = 50  # 训练轮数
+batch_size = 32  # 批次大小
+
+# ------------------------------------------------------------
+# ML 训练配置
+# ------------------------------------------------------------
+[ml.training]
+train_ratio = 0.7  # 训练集比例
+valid_ratio = 0.15  # 验证集比例
+test_ratio = 0.15  # 测试集比例
+class_weights = [1.0, 0.5, 1.0]  # 各类别权重 (down, neutral, up)
+
+# ------------------------------------------------------------
+# ML 回测配置
+# ------------------------------------------------------------
+[ml.backtest]
+initial_capital = 10000.0  # 初始资金
+fee_taker = 0.0005  # Taker 手续费: 0.05%
+fee_maker = 0.0002  # Maker 手续费: 0.02%
+funding_annual = 0.1095  # 资金费率年化: 10.95%
+
+# ------------------------------------------------------------
+# ML 配对配置
+# ------------------------------------------------------------
+[ml.pairs]
+# 配对列表，与上面的 [symbols] pair_list 联动
+# 格式: ["BTC-ETH", "BTC-SOL", "ETH-SOL", "xyz:GOLD-xyz:SILVER"]
+list = ["BTC-ETH", "BTC-SOL", "ETH-SOL"]

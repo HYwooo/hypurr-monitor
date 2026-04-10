@@ -56,7 +56,7 @@ def price_lt(a: float, b: float) -> bool:
     return a < b - PRECISION_EPSILON
 
 
-async def fetch_pair_klines(  # noqa: PLR0913, PLR0912
+async def fetch_pair_klines(  # noqa: PLR0912
     symbol: str,
     limit: int = 500,
     interval: str = "1h",
@@ -68,7 +68,7 @@ async def fetch_pair_klines(  # noqa: PLR0913, PLR0912
     """
     Fetch and merge pair trading K-lines.
 
-    Pair trading (e.g. BTCUSDT:ETHUSDT) price = BTC price / ETH price.
+    Pair trading (e.g. BTC-ETH) price = BTC price / ETH price.
     Align two trading pairs K-lines by timestamp and merge into one pair K-line:
     - open = ratio_open = open1 / open2
     - high = max(ratio_open, ratio_close)
@@ -76,7 +76,7 @@ async def fetch_pair_klines(  # noqa: PLR0913, PLR0912
     - close = ratio_close = close1 / close2
 
     Args:
-        symbol: Pair trading symbol, e.g. "BTCUSDT:ETHUSDT"
+        symbol: Pair trading symbol, e.g. "BTC-ETH"
         limit: K-line count
         interval: K-line interval
         proxy: HTTP proxy
@@ -87,7 +87,7 @@ async def fetch_pair_klines(  # noqa: PLR0913, PLR0912
     Returns:
         Merged K-line list, format: [timestamp, ratio_open, ratio_high, ratio_low, ratio_close, volume]
     """
-    parts = symbol.split(":")
+    parts = symbol.split("-")
     if fetch_klines_fn is None:
         from hyperliquid.rest_client import HyperliquidREST
 
@@ -145,7 +145,7 @@ async def fetch_pair_klines(  # noqa: PLR0913, PLR0912
     return sorted(merged, key=lambda x: x[0])
 
 
-async def update_klines(  # noqa: PLR0913, PLR0912
+async def update_klines(  # noqa: PLR0912
     symbol: str,
     kline_cache: dict[str, Any],
     last_kline_time: dict[str, Any],
@@ -197,7 +197,7 @@ async def update_klines(  # noqa: PLR0913, PLR0912
 
             interval = "1h"
             cached = get_cached_klines(symbol, interval)
-            if cached and len(cached) >= 200:  # noqa: PLR2004
+            if cached and len(cached) >= 200:
                 klines = cached
                 logger.debug(f"[update_klines] {symbol} cache hit, using {len(klines)} cached klines")
             elif fetch_klines_fn:
@@ -224,7 +224,7 @@ async def update_klines(  # noqa: PLR0913, PLR0912
         logger.warning(f"[update_klines] {symbol} fetch failed or timeout, skipping")
 
 
-async def recalculate_states(  # noqa: PLR0913
+async def recalculate_states(
     symbol: str,
     kline_cache: dict[str, Any],
     benchmark: dict[str, Any],
@@ -336,7 +336,7 @@ async def recalculate_states(  # noqa: PLR0913
         }
 
 
-async def check_signals(  # noqa: PLR0913
+async def check_signals(
     symbol: str,
     mark_prices: dict[str, Any],
     mark_price_times: dict[str, Any],
@@ -383,7 +383,7 @@ async def check_signals(  # noqa: PLR0913
         )
 
 
-async def check_signals_impl(  # noqa: PLR0913
+async def check_signals_impl(
     symbol: str,
     mark_prices: dict[str, Any],
     mark_price_times: dict[str, Any],
@@ -497,7 +497,7 @@ async def check_signals_impl(  # noqa: PLR0913
             }
 
 
-async def check_trailing_stop(  # noqa: PLR0913, PLR0912
+async def check_trailing_stop(  # noqa: PLR0912
     symbol: str,
     current_price: float,
     trailing_stop: dict[str, Any],
@@ -616,7 +616,7 @@ async def check_trailing_stop(  # noqa: PLR0913, PLR0912
                 last_alert_time[symbol] = 0
 
 
-async def recalculate_states_clustering(  # noqa: PLR0913
+async def recalculate_states_clustering(
     symbol: str,
     kline_cache: dict[str, Any],
     benchmark: dict[str, Any],
@@ -745,7 +745,7 @@ async def recalculate_states_clustering(  # noqa: PLR0913
         }
 
 
-async def check_signals_clustering(  # noqa: PLR0913
+async def check_signals_clustering(
     symbol: str,
     mark_prices: dict[str, Any],
     mark_price_times: dict[str, Any],
@@ -806,7 +806,7 @@ async def check_signals_clustering(  # noqa: PLR0913
         )
 
 
-async def check_signals_clustering_impl(  # noqa: PLR0913
+async def check_signals_clustering_impl(
     symbol: str,
     mark_prices: dict[str, Any],
     mark_price_times: dict[str, Any],

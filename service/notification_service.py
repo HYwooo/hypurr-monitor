@@ -26,6 +26,7 @@ from indicators import (
     run_atr_channel,
 )
 from logging_config import get_logger
+from ml_common import MLConfig
 from models import Kline
 from notifications import log_warning
 from notifications.webhook import send_webhook
@@ -37,6 +38,7 @@ from signals import (
     recalculate_states_clustering,
     update_klines,
 )
+from strategy.signal_selector import MLSignalStrategy
 
 logger = get_logger(__name__)
 
@@ -55,7 +57,7 @@ class NotificationService:
     - trailing_stop: {symbol: {direction, entry_price, atr15m_*, active}} trailing stop state
     """
 
-    def __init__(self, config_path: str = "config.toml", debug: bool = False):  # noqa: PLR0915
+    def __init__(self, config_path: str = "config.toml", debug: bool = False):
         self.config_path = config_path
         self.debug = debug
         self.config = self._load_config(config_path)
@@ -68,6 +70,9 @@ class NotificationService:
                 parts = p.split("-", 1)
                 self._pair_components[p] = (parts[0], parts[1])
         self.symbols: list[str] = self.single_list + self.pair_list
+
+        self.single_strategy: str = sym_config.get("single_strategy", "atr_channel")
+        self.pair_strategy: str = sym_config.get("pair_strategy", "clustering_st")
         self.webhook_url = self.config["webhook"]["url"]
         self.webhook_format = self.config["webhook"].get("format", "card")
 
@@ -134,6 +139,19 @@ class NotificationService:
         self._ws_tasks: list[asyncio.Task[None]] = []
         self._logged_initial_price: set[str] = set()
 
+        ml_config = self.config.get("ml", {})
+        self.ml_enable = ml_config.get("enable", False)
+        self.ml_model_path = ml_config.get("model_path", "models/ml/")
+        self.ml_config = MLConfig(
+            neutral_scale=ml_config.get("labeling", {}).get("neutral_scale", 0.5),
+            lookforward_bars=ml_config.get("labeling", {}).get("lookforward_bars", 1),
+            train_ratio=ml_config.get("training", {}).get("train_ratio", 0.7),
+            valid_ratio=ml_config.get("training", {}).get("valid_ratio", 0.15),
+            use_lstm_residual=ml_config.get("model", {}).get("use_lstm_residual", True),
+            primary_model=ml_config.get("model", {}).get("primary", "catboost"),
+        )
+        self.ml_strategy: MLSignalStrategy | None = None
+
     def _is_pair_trading(self, symbol: str) -> bool:
         """Check if symbol is part of any pair (e.g. BTC in BTC-ETH -> True)."""
         return any(symbol in comp for comp in self._pair_components.values())
@@ -145,6 +163,12 @@ class NotificationService:
     def _is_pair_symbol(self, symbol: str) -> bool:
         """Check if symbol is a pair symbol itself (e.g. BTC-ETH -> True, BTC -> False)."""
         return symbol in self.pair_list
+
+    def _get_strategy_for_symbol(self, symbol: str) -> str:
+        """Get the strategy for a symbol based on its type (single or pair)."""
+        if self._is_pair_symbol(symbol):
+            return self.pair_strategy
+        return self.single_strategy
 
     def _get_timestamp(self) -> str:
         """Get formatted timestamp based on configured timezone."""
@@ -163,7 +187,7 @@ class NotificationService:
     def _load_config(self, config_path: str) -> dict[str, Any]:
         """Load config from TOML file."""
         if not Path(config_path).exists():
-            raise FileNotFoundError("Config file not found")  # noqa: TRY003
+            raise FileNotFoundError("Config file not found")
         return cast(dict[str, Any], toml.load(config_path))
 
     def _increment_alert_count(self) -> None:
@@ -282,10 +306,8 @@ class NotificationService:
                             if price <= 0:
                                 continue
                             await self._ct_check_trailing_stop(sym, price)
-                            if self._is_pair_symbol(sym):
-                                await self._ct_check_signals_clustering(sym)
-                            elif not self._is_pair_trading(sym):
-                                await self._ct_check_signals(sym)
+                            if not self._is_pair_trading(sym):
+                                await self._ct_check_signals_by_strategy(sym)
                         for pair_sym, (c1, c2) in self._pair_components.items():
                             p1 = self.mark_prices.get(c1, 0)
                             p2 = self.mark_prices.get(c2, 0)
@@ -297,7 +319,7 @@ class NotificationService:
                                     self._logged_initial_price.add(pair_sym)
                                     self._log_symbol_state(pair_sym)
                                 await self._ct_check_trailing_stop(pair_sym, pair_price)
-                                await self._ct_check_signals_clustering(pair_sym)
+                                await self._ct_check_signals_by_strategy(pair_sym)
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
             except Exception:
@@ -395,6 +417,63 @@ class NotificationService:
             self._send_webhook,
             self._increment_alert_count,
         )
+
+    async def _ct_check_signals_by_strategy(self, symbol: str) -> None:
+        """Dispatch signal check based on configured strategy for the symbol."""
+        strategy = self._get_strategy_for_symbol(symbol)
+        if strategy == "clustering_st":
+            await self._ct_check_signals_clustering(symbol)
+        elif strategy == "ml":
+            await self._ct_check_ml_signals(symbol)
+        else:
+            await self._ct_check_signals(symbol)
+
+    async def _ct_check_ml_signals(self, symbol: str) -> None:
+        """ML signal detection via trained CatBoost+LSTM model."""
+        if not self.ml_enable:
+            return
+        if self.ml_strategy is None or not self.ml_strategy.is_ready():
+            return
+
+        klines = self.kline_cache.get(symbol, [])
+        if len(klines) < 50:
+            return
+
+        signal = self.ml_strategy.predict(klines)
+        if signal is None:
+            return
+
+        last_alert = self.last_alert_time.get(symbol, 0)
+        if time.time() - last_alert < 60:
+            return
+
+        direction_map = {
+            "UP": "涨",
+            "DOWN": "跌",
+            "NEUTRAL": "平",
+        }
+        direction = direction_map.get(signal.signal_type.name, signal.signal_type.name)
+
+        extra = {
+            "symbol": symbol,
+            "signal": signal.signal_type.name,
+            "direction_cn": direction,
+            "confidence": f"{signal.confidence:.2%}",
+            "prob_down": f"{signal.prob_down:.2%}",
+            "prob_neutral": f"{signal.prob_neutral:.2%}",
+            "prob_up": f"{signal.prob_up:.2%}",
+            "price": f"{signal.price:.6f}",
+            "atr": f"{signal.atr:.6f}",
+            "model": "CatBoost+LSTM",
+        }
+
+        await self._send_webhook(
+            "ML_SIGNAL",
+            f"[{symbol}] ML 信号: {direction} ({signal.confidence:.2%}) | P(跌)={signal.prob_down:.2%} P(平)={signal.prob_neutral:.2%} P(涨)={signal.prob_up:.2%}",
+            extra,
+        )
+        self.last_alert_time[symbol] = time.time()
+        self._increment_alert_count()
 
     async def _get_component_klines(
         self,
@@ -604,6 +683,22 @@ class NotificationService:
             self.debug,
         )
 
+    def _initialize_ml_strategy(self) -> None:
+        """Initialize ML strategy by loading pre-trained models."""
+        if not self.ml_enable:
+            return
+        try:
+            self.ml_strategy = MLSignalStrategy(self.ml_config)
+            loaded = self.ml_strategy.load_models(self.ml_model_path)
+            if loaded:
+                logger.info(f"ML strategy loaded from {self.ml_model_path}")
+                logger.info(f"ML model info: {self.ml_strategy.model_info}")
+            else:
+                logger.warning(f"Failed to load ML models from {self.ml_model_path}")
+        except Exception:
+            logger.exception("ML strategy initialization failed")
+            self.ml_strategy = None
+
     async def initialize(self) -> None:
         """Initialize service: fetch all K-lines and calculate indicators."""
         logger.info(f"Initializing klines for {len(self.symbols)} symbols...")
@@ -632,6 +727,9 @@ class NotificationService:
                 p2 = self.mark_prices.get(c2, 0)
                 if p1 > 0 and p2 > 0:
                     self.mark_prices[symbol] = p1 / p2
+
+        if self.ml_enable:
+            self._initialize_ml_strategy()
 
         for symbol in self.single_list:
             await self._recalculate_states(symbol)

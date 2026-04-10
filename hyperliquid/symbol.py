@@ -40,7 +40,7 @@ def parse_hyperliquid_symbol(symbol: str) -> HyperliquidSymbol:  # noqa: PLR0911
 
     if ":" in original:
         parts = original.split(":")
-        if len(parts) == 2:  # noqa: PLR2004
+        if len(parts) == 2:
             prefix, coin = parts
             prefix_lower = prefix.lower()
 

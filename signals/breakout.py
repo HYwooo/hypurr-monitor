@@ -15,7 +15,7 @@ MIN_KLINES_FOR_BREAKOUT = 2
 MAX_KLINE_MONITOR_COUNT = 20
 
 
-async def start_breakout_monitor(  # noqa: PLR0913
+async def start_breakout_monitor(
     symbol: str,
     direction: str,
     price: float,

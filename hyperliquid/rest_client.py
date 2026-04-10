@@ -489,7 +489,7 @@ class HyperliquidREST:
             return original[5:].strip(), {"type": "spot"}
         if ":" in original:
             parts = original.split(":", 1)
-            if len(parts) == 2:  # noqa: PLR2004
+            if len(parts) == 2:
                 return original, {}
         return original, {}
         """
@@ -508,7 +508,7 @@ class HyperliquidREST:
 
         if ":" in original:
             parts = original.split(":", 1)
-            if len(parts) == 2:  # noqa: PLR2004
+            if len(parts) == 2:
                 return original, {}
 
         return original, {}

@@ -139,7 +139,7 @@ def _kmeans_clustering(
     )
 
 
-def clustering_supertrend(  # noqa: PLR0913, PLR0912, PLR0915
+def clustering_supertrend(  # noqa: PLR0912
     close: np.ndarray[Any, Any],
     high: np.ndarray[Any, Any],
     low: np.ndarray[Any, Any],
@@ -318,7 +318,7 @@ def clustering_supertrend(  # noqa: PLR0913, PLR0912, PLR0915
     return state.ts, state.perf_ama, state
 
 
-def clustering_supertrend_single(  # noqa: PLR0913
+def clustering_supertrend_single(
     close: float,
     high: float,
     low: float,
