@@ -1,5 +1,5 @@
 """
-可视化 LSTM+CatBoost Walk-Forward 结果
+Visualization for LSTM+CatBoost Walk-Forward Results
 
 Usage:
     uv run python scripts/plot_lstm_results.py
@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import matplotlib
 
 matplotlib.use("Agg")
+# UseDejaVu Sans which supports Latin characters well and avoids CJK font issues
+plt.rcParams["font.family"] = "DejaVu Sans"
 
 from pathlib import Path
 

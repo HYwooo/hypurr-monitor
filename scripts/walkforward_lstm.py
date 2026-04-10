@@ -50,7 +50,7 @@ from models import Kline
 from ml.labels.three_class import ThreeClassLabeler
 
 # ============ 配置 ============
-NEUTRAL_SCALE = 0.55
+NEUTRAL_SCALE = 1.3
 LOOKFORWARD_BARS = 6  # 未来6根K线 (1.5h)
 SEQ_LEN = 48  # 窗口长度 (12h)
 HIDDEN_DIM = 128
@@ -60,9 +60,9 @@ CLASS_WEIGHTS = [2.5, 1.0, 2.5]  # [DOWN, NEUTRAL, UP]
 PROBABILITY_THRESHOLD = 0.12
 
 # LSTM 预训练参数
-LSTM_EPOCHS = 20
-LSTM_BATCH_SIZE = 512
-LSTM_LR = 0.002
+LSTM_EPOCHS = 5
+LSTM_BATCH_SIZE = 2048
+LSTM_LR = 0.01
 
 # Walk-Forward 配置（根据实际数据范围调整）
 # 数据范围：2024-01-01 到 2025-04-01 (15m K线)
@@ -138,11 +138,25 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     features["kdj_k"] = k
     features["kdj_d"] = d
 
-    # MACD
+    # MACD (标准)
     macd, macd_sig, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
     features["macd_dif"] = macd
     features["macd_dea"] = macd_sig
     features["macd_hist"] = macd_hist
+
+    # MACD-V = [(12-EMA - 26-EMA) / ATR(26)] * 100
+    ema_12 = talib.EMA(close, 12)
+    ema_26 = talib.EMA(close, 26)
+    atr_26 = talib.ATR(high, low, close, 26)
+    macd_v = ((ema_12 - ema_26) / (atr_26 + 1e-10)) * 100
+    features["macd_v"] = macd_v
+
+    # Signal line = 9-period EMA of MACD-V
+    macd_v_signal = talib.EMA(macd_v, 9)
+    features["macd_v_signal"] = macd_v_signal
+
+    # Histogram = MACD-V - Signal Line
+    features["macd_v_hist"] = macd_v - macd_v_signal
 
     # 布林带位置
     upper, middle, lower = talib.BBANDS(close, timeperiod=20)
@@ -388,7 +402,7 @@ def train_lstm(
     best_loss = float("inf")
     best_state: dict | None = None
     patience_counter = 0
-    max_patience = 5
+    max_patience = 2
 
     for epoch in range(epochs):
         # 训练
@@ -466,6 +480,7 @@ def walkforward_train(
     train_months: list[int],
     valid_month: int,
     test_month: int,
+    fold_index: int = 0,
 ) -> dict[str, Any]:
     """
     Walk-Forward 训练一个 Fold
@@ -476,6 +491,7 @@ def walkforward_train(
         train_months: 训练集月份列表 (YYYYMM 格式)
         valid_month: 验证集月份 (YYYYMM 格式)
         test_month: 测试集月份 (YYYYMM 格式)
+        fold_index: Fold 索引
 
     Returns:
         评估结果
@@ -588,14 +604,14 @@ def walkforward_train(
 
     # CatBoost 训练
     cb_model = CatBoostClassifier(
-        iterations=1000,
-        learning_rate=0.05,
+        iterations=300,
+        learning_rate=0.08,
         depth=6,
         l2_leaf_reg=3.0,
         loss_function="MultiClass",
         class_weights=CLASS_WEIGHTS,
-        early_stopping_rounds=100,
-        verbose=100,
+        early_stopping_rounds=30,
+        verbose=False,
     )
 
     cb_model.fit(
@@ -604,6 +620,38 @@ def walkforward_train(
         eval_set=(valid_features, valid_labels_extracted),
         verbose=False,
     )
+
+    # ============ 模型存档 ============
+    model_dir = Path(f"models/lstm_catboost/fold_{fold_index}")
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    # 保存 LSTM 模型
+    torch.save(
+        {
+            "model_state_dict": lstm_model.state_dict(),
+            "n_features": n_features,
+            "hidden_dim": HIDDEN_DIM,
+            "lstm_output_dim": LSTM_OUTPUT_DIM,
+            "seq_len": SEQ_LEN,
+            "config": {
+                "neutral_scale": NEUTRAL_SCALE,
+                "lookforward_bars": LOOKFORWARD_BARS,
+                "focal_gamma": FOCAL_GAMMA,
+                "class_weights": CLASS_WEIGHTS,
+            },
+        },
+        model_dir / "lstm_model.pt",
+    )
+
+    # 保存 CatBoost 模型
+    cb_model.save_model(str(model_dir / "catboost_model.cbm"))
+
+    # 保存 Scaler
+    import joblib
+
+    joblib.dump(scaler, model_dir / "scaler.joblib")
+
+    print(f"  模型已保存到 {model_dir}")
 
     # ============ 阶段3: 测试集评估 ============
     print("  阶段3: 测试集评估...")
@@ -674,39 +722,105 @@ def compute_metrics(
     y_pred: np.ndarray,
     y_proba: np.ndarray,
 ) -> dict[str, Any]:
-    """计算所有评估指标"""
+    """计算所有评估指标，包括 18 项概率和综合评分"""
     metrics = {}
 
     # 基础准确率
     metrics["accuracy"] = float(np.mean(y_pred == y_true))
 
-    # Macro F1
-    precision, recall, f1, support = precision_recall_fscore_support(
-        y_true, y_pred, labels=[DOWN_LABEL, NEUTRAL_LABEL, UP_LABEL], average=None
+    # ========== 混淆矩阵计数 ==========
+    # cm[i][j] = 实际i类预测为j类的数量
+    cm = confusion_matrix(y_true, y_pred, labels=[DOWN_LABEL, NEUTRAL_LABEL, UP_LABEL])
+
+    # 各维度命名: 0=DOWN(L), 1=NEUTRAL(N), 2=UP(S)
+    # cm[0][:] = 实际DOWN, cm[:][0] = 预测DOWN
+    n_down, n_neutral, n_up = cm.sum(axis=1)  # 各类实际数量
+    pred_down, pred_neutral, pred_up = cm.sum(axis=0)  # 各类预测数量
+
+    # ========== P(actual | predicted) — 9项 (列方向归一化) ==========
+    # Precision 各项
+    metrics["P_aL_pL"] = float(cm[0][0] / pred_down) if pred_down > 0 else 0.0  # 预测L实际L
+    metrics["P_aN_pL"] = float(cm[1][0] / pred_down) if pred_down > 0 else 0.0  # 预测L实际N
+    metrics["P_aS_pL"] = float(cm[2][0] / pred_down) if pred_down > 0 else 0.0  # 预测L实际S ← 灾难！
+
+    metrics["P_aL_pN"] = float(cm[0][1] / pred_neutral) if pred_neutral > 0 else 0.0  # 预测N实际L
+    metrics["P_aN_pN"] = float(cm[1][1] / pred_neutral) if pred_neutral > 0 else 0.0  # 预测N实际N
+    metrics["P_aS_pN"] = float(cm[2][1] / pred_neutral) if pred_neutral > 0 else 0.0  # 预测N实际S
+
+    metrics["P_aL_pS"] = float(cm[0][2] / pred_up) if pred_up > 0 else 0.0  # 预测S实际L ← 灾难！
+    metrics["P_aN_pS"] = float(cm[1][2] / pred_up) if pred_up > 0 else 0.0  # 预测S实际N
+    metrics["P_aS_pS"] = float(cm[2][2] / pred_up) if pred_up > 0 else 0.0  # 预测S实际S
+
+    # ========== P(predicted | actual) — 9项 (行方向归一化) ==========
+    # Recall 各项
+    metrics["P_pL_aL"] = float(cm[0][0] / n_down) if n_down > 0 else 0.0  # 实际L预测L
+    metrics["P_pN_aL"] = float(cm[1][0] / n_down) if n_down > 0 else 0.0  # 实际L预测N
+    metrics["P_pS_aL"] = float(cm[2][0] / n_down) if n_down > 0 else 0.0  # 实际L预测S
+
+    metrics["P_pL_aN"] = float(cm[0][1] / n_neutral) if n_neutral > 0 else 0.0  # 实际N预测L
+    metrics["P_pN_aN"] = float(cm[1][1] / n_neutral) if n_neutral > 0 else 0.0  # 实际N预测N
+    metrics["P_pS_aN"] = float(cm[2][1] / n_neutral) if n_neutral > 0 else 0.0  # 实际N预测S
+
+    metrics["P_pL_aS"] = float(cm[0][2] / n_up) if n_up > 0 else 0.0  # 实际S预测L
+    metrics["P_pN_aS"] = float(cm[1][2] / n_up) if n_up > 0 else 0.0  # 实际S预测N
+    metrics["P_pS_aS"] = float(cm[2][2] / n_up) if n_up > 0 else 0.0  # 实际S预测S
+
+    # ========== 基础 Precision/Recall/F1 ==========
+    metrics["precision_down"] = metrics["P_aL_pL"]
+    metrics["precision_neutral"] = metrics["P_aN_pN"]
+    metrics["precision_up"] = metrics["P_aS_pS"]
+
+    metrics["recall_down"] = metrics["P_pL_aL"]
+    metrics["recall_neutral"] = metrics["P_pN_aN"]
+    metrics["recall_up"] = metrics["P_pS_aS"]
+
+    # F1 scores
+    for cls, p_key, r_key, f_key in [
+        ("down", "precision_down", "recall_down", "f1_down"),
+        ("neutral", "precision_neutral", "recall_neutral", "f1_neutral"),
+        ("up", "precision_up", "recall_up", "f1_up"),
+    ]:
+        p, r = metrics[p_key], metrics[r_key]
+        metrics[f_key] = float(2 * p * r / (p + r)) if (p + r) > 0 else 0.0
+
+    metrics["support_down"] = int(n_down)
+    metrics["support_neutral"] = int(n_neutral)
+    metrics["support_up"] = int(n_up)
+
+    metrics["macro_f1"] = float(np.mean([metrics["f1_down"], metrics["f1_neutral"], metrics["f1_up"]]))
+    metrics["macro_precision"] = float(
+        np.mean([metrics["precision_down"], metrics["precision_neutral"], metrics["precision_up"]])
     )
+    metrics["macro_recall"] = float(np.mean([metrics["recall_down"], metrics["recall_neutral"], metrics["recall_up"]]))
 
-    metrics["precision_down"] = float(precision[0])
-    metrics["precision_neutral"] = float(precision[1])
-    metrics["precision_up"] = float(precision[2])
-    metrics["recall_down"] = float(recall[0])
-    metrics["recall_neutral"] = float(recall[1])
-    metrics["recall_up"] = float(recall[2])
-    metrics["f1_down"] = float(f1[0])
-    metrics["f1_neutral"] = float(f1[1])
-    metrics["f1_up"] = float(f1[2])
-    metrics["support_down"] = int(support[0])
-    metrics["support_neutral"] = int(support[1])
-    metrics["support_up"] = int(support[2])
-
-    metrics["macro_f1"] = float(np.mean(f1))
-    metrics["macro_precision"] = float(np.mean(precision))
-    metrics["macro_recall"] = float(np.mean(recall))
-
-    # Long/Short 召回率（重点关注）
+    # Long/Short 指标
     metrics["long_recall"] = metrics["recall_up"]
     metrics["short_recall"] = metrics["recall_down"]
     metrics["long_precision"] = metrics["precision_up"]
     metrics["short_precision"] = metrics["precision_down"]
+
+    # ========== 综合评分 (方向反了狠狠惩罚) ==========
+    # Score = (Precision_L + Precision_N + Precision_S) / 3
+    #       + (Recall_L + Recall_N + Recall_S) / 3
+    #       + (P(pL|aL) + P(pN|aN) + P(pS|aS)) / 3
+    #       - 5.0 × (P(aS|pL) + P(aL|pS))  ← 方向反了狠狠惩罚
+
+    avg_precision = (metrics["precision_down"] + metrics["precision_neutral"] + metrics["precision_up"]) / 3
+    avg_recall = (metrics["recall_down"] + metrics["recall_neutral"] + metrics["recall_up"]) / 3
+    avg_direction_correct = (metrics["P_pL_aL"] + metrics["P_pN_aN"] + metrics["P_pS_aS"]) / 3
+
+    # 方向反了惩罚项
+    direction_flip_penalty = 5.0 * (metrics["P_aS_pL"] + metrics["P_aL_pS"])  # L↔S 互反最严重
+
+    # 还有Neutral和其他类别的混淆惩罚（权重较低）
+    false_break_penalty = (
+        2.0 * (metrics["P_aL_pN"] + metrics["P_aS_pN"])  # 假突破 Neutral
+        + 1.0 * (metrics["P_aN_pL"] + metrics["P_aN_pS"])  # 踏空 Neutral
+    )
+
+    metrics["composite_score"] = (
+        avg_precision + avg_recall + avg_direction_correct - direction_flip_penalty - false_break_penalty
+    )
 
     return metrics
 
@@ -721,46 +835,61 @@ def plot_results(results: list[dict[str, Any]], output_prefix: str = "walkforwar
         return
 
     windows = range(len(results))
+    x = np.array(list(windows))
 
-    fig, axes = plt.subplots(3, 2, figsize=(16, 14))
-    fig.suptitle("LSTM+CatBoost Walk-Forward Results", fontsize=16, fontweight="bold")
+    # 4行2列: Macro F1, Composite Score, Long/Short, 概率矩阵
+    fig, axes = plt.subplots(4, 2, figsize=(16, 20))
+    fig.suptitle("LSTM+CatBoost Walk-Forward Results\n(方向反了狠狠惩罚评分体系)", fontsize=16, fontweight="bold")
 
     # 1. Macro F1 (主指标)
     ax1 = axes[0, 0]
     macro_f1 = [r["macro_f1"] for r in results]
     macro_f1_post = [r["macro_f1_post"] for r in results]
-    ax1.bar(windows, macro_f1, width=0.4, label="Raw", color="steelblue", alpha=0.8)
-    ax1.bar([w + 0.4 for w in windows], macro_f1_post, width=0.4, label="Post", color="forestgreen", alpha=0.8)
+    width = 0.35
+    bars1 = ax1.bar(x - width / 2, macro_f1, width, label="Raw", color="steelblue", alpha=0.8)
+    bars2 = ax1.bar(x + width / 2, macro_f1_post, width, label="Post", color="forestgreen", alpha=0.8)
     ax1.set_xlabel("Fold")
     ax1.set_ylabel("Macro F1")
-    ax1.set_title("Macro F1 Score (Primary Metric)")
+    ax1.set_title("Macro F1 Score")
     ax1.legend()
     ax1.grid(True, alpha=0.3, axis="y")
     ax1.set_ylim([0, 1.0])
     ax1.set_xticks(list(windows))
-    for i, v in enumerate(macro_f1_post):
-        ax1.text(i + 0.4, v + 0.02, f"{v:.3f}", ha="center", fontsize=9)
+    for bar in bars2:
+        ax1.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.02,
+            f"{bar.get_height():.3f}",
+            ha="center",
+            fontsize=9,
+        )
 
-    # 2. Accuracy
+    # 2. Composite Score (方向反了狠狠惩罚)
     ax2 = axes[0, 1]
-    acc = [r["accuracy"] for r in results]
-    acc_post = [r["accuracy_post"] for r in results]
-    ax2.bar(windows, acc, width=0.4, label="Raw", color="steelblue", alpha=0.8)
-    ax2.bar([w + 0.4 for w in windows], acc_post, width=0.4, label="Post", color="forestgreen", alpha=0.8)
+    comp_scores = [r.get("composite_score", 0) for r in results]
+    comp_scores_post = [r.get("composite_score_post", 0) for r in results]
+    bars3 = ax2.bar(x - width / 2, comp_scores, width, label="Raw", color="crimson", alpha=0.8)
+    bars4 = ax2.bar(x + width / 2, comp_scores_post, width, label="Post", color="darkred", alpha=0.8)
     ax2.set_xlabel("Fold")
-    ax2.set_ylabel("Accuracy")
-    ax2.set_title("Accuracy")
+    ax2.set_ylabel("Composite Score")
+    ax2.set_title("Composite Score (方向反了惩罚5x)")
     ax2.legend()
     ax2.grid(True, alpha=0.3, axis="y")
-    ax2.set_ylim([0, 1.0])
+    ax2.axhline(y=0, color="black", linestyle="-", linewidth=0.5)
     ax2.set_xticks(list(windows))
+    for bar in bars4:
+        ax2.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.05,
+            f"{bar.get_height():.3f}",
+            ha="center",
+            fontsize=9,
+        )
 
     # 3. Long/Short Recall
     ax3 = axes[1, 0]
     long_r = [r["long_recall"] for r in results]
     short_r = [r["short_recall"] for r in results]
-    x = np.array(list(windows))
-    width = 0.35
     ax3.bar(x - width / 2, long_r, width, label="Long Recall", color="crimson", alpha=0.8)
     ax3.bar(x + width / 2, short_r, width, label="Short Recall", color="royalblue", alpha=0.8)
     ax3.set_xlabel("Fold")
@@ -796,10 +925,10 @@ def plot_results(results: list[dict[str, Any]], output_prefix: str = "walkforwar
     f1_down = [r["f1_down"] for r in results]
     f1_neutral = [r["f1_neutral"] for r in results]
     f1_up = [r["f1_up"] for r in results]
-    width = 0.25
-    ax5.bar(x - width, f1_down, width, label="DOWN F1", color="royalblue", alpha=0.8)
-    ax5.bar(x, f1_neutral, width, label="NEUTRAL F1", color="gray", alpha=0.8)
-    ax5.bar(x + width, f1_up, width, label="UP F1", color="crimson", alpha=0.8)
+    w = 0.25
+    ax5.bar(x - w, f1_down, w, label="DOWN F1", color="royalblue", alpha=0.8)
+    ax5.bar(x, f1_neutral, w, label="NEUTRAL F1", color="gray", alpha=0.8)
+    ax5.bar(x + w, f1_up, w, label="UP F1", color="crimson", alpha=0.8)
     ax5.set_xlabel("Fold")
     ax5.set_ylabel("F1 Score")
     ax5.set_title("F1 Score by Class")
@@ -815,7 +944,6 @@ def plot_results(results: list[dict[str, Any]], output_prefix: str = "walkforwar
         cm_raw += np.array(r["confusion_matrix_raw"])
     cm_avg = cm_raw / len(results)
 
-    # 绘制热力图
     im = ax6.imshow(cm_avg, cmap="Blues", aspect="auto")
     ax6.set_xticks([0, 1, 2])
     ax6.set_yticks([0, 1, 2])
@@ -825,20 +953,78 @@ def plot_results(results: list[dict[str, Any]], output_prefix: str = "walkforwar
     ax6.set_ylabel("Actual")
     ax6.set_title("Confusion Matrix (Average)")
 
-    # 添加数值标签
     for i in range(3):
         for j in range(3):
-            text = ax6.text(
-                j,
-                i,
-                f"{cm_avg[i, j]:.0f}",
-                ha="center",
-                va="center",
-                color="white" if cm_avg[i, j] > cm_avg.max() / 2 else "black",
-                fontsize=12,
-            )
-
+            color = "white" if cm_avg[i, j] > cm_avg.max() / 2 else "black"
+            ax6.text(j, i, f"{cm_avg[i, j]:.0f}", ha="center", va="center", color=color, fontsize=12)
     plt.colorbar(im, ax=ax6)
+
+    # 7. P(actual|predicted) Heatmap (Average)
+    ax7 = axes[3, 0]
+    # 9项概率矩阵
+    p_actual_pred = np.array(
+        [
+            [results[0]["P_aL_pL"], results[0]["P_aN_pL"], results[0]["P_aS_pL"]],
+            [results[0]["P_aL_pN"], results[0]["P_aN_pN"], results[0]["P_aS_pN"]],
+            [results[0]["P_aL_pS"], results[0]["P_aN_pS"], results[0]["P_aS_pS"]],
+        ]
+    )
+    for r in results[1:]:
+        p_actual_pred += np.array(
+            [
+                [r["P_aL_pL"], r["P_aN_pL"], r["P_aS_pL"]],
+                [r["P_aL_pN"], r["P_aN_pN"], r["P_aS_pN"]],
+                [r["P_aL_pS"], r["P_aN_pS"], r["P_aS_pS"]],
+            ]
+        )
+    p_actual_pred /= len(results)
+
+    im7 = ax7.imshow(p_actual_pred, cmap="RdYlGn", aspect="auto", vmin=0, vmax=1)
+    ax7.set_xticks([0, 1, 2])
+    ax7.set_yticks([0, 1, 2])
+    ax7.set_xticklabels(["→L", "→N", "→S"])
+    ax7.set_yticklabels(["L", "N", "S"])
+    ax7.set_xlabel("Predicted")
+    ax7.set_ylabel("Actual")
+    ax7.set_title("P(actual|predicted) [方向反了看角落]")
+    for i in range(3):
+        for j in range(3):
+            color = "white" if p_actual_pred[i, j] > 0.5 else "black"
+            ax7.text(j, i, f"{p_actual_pred[i, j]:.2f}", ha="center", va="center", color=color, fontsize=10)
+    plt.colorbar(im7, ax=ax7)
+
+    # 8. P(predicted|actual) Heatmap (Average)
+    ax8 = axes[3, 1]
+    p_pred_actual = np.array(
+        [
+            [results[0]["P_pL_aL"], results[0]["P_pN_aL"], results[0]["P_pS_aL"]],
+            [results[0]["P_pL_aN"], results[0]["P_pN_aN"], results[0]["P_pS_aN"]],
+            [results[0]["P_pL_aS"], results[0]["P_pN_aS"], results[0]["P_pS_aS"]],
+        ]
+    )
+    for r in results[1:]:
+        p_pred_actual += np.array(
+            [
+                [r["P_pL_aL"], r["P_pN_aL"], r["P_pS_aL"]],
+                [r["P_pL_aN"], r["P_pN_aN"], r["P_pS_aN"]],
+                [r["P_pL_aS"], r["P_pN_aS"], r["P_pS_aS"]],
+            ]
+        )
+    p_pred_actual /= len(results)
+
+    im8 = ax8.imshow(p_pred_actual, cmap="RdYlGn", aspect="auto", vmin=0, vmax=1)
+    ax8.set_xticks([0, 1, 2])
+    ax8.set_yticks([0, 1, 2])
+    ax8.set_xticklabels(["L←", "N←", "S←"])
+    ax8.set_yticklabels(["L", "N", "S"])
+    ax8.set_xlabel("Actual")
+    ax8.set_ylabel("Predicted")
+    ax8.set_title("P(predicted|actual) [召回率分布]")
+    for i in range(3):
+        for j in range(3):
+            color = "white" if p_pred_actual[i, j] > 0.5 else "black"
+            ax8.text(j, i, f"{p_pred_actual[i, j]:.2f}", ha="center", va="center", color=color, fontsize=10)
+    plt.colorbar(im8, ax=ax8)
 
     plt.tight_layout()
     plot_path = f"{output_prefix}_results.png"
@@ -897,62 +1083,157 @@ def main() -> None:
     print("\n" + "-" * 40)
     print("Fold 0: 训练2024Q1-Q2, 验证2024Q3, 测试2024Q4")
     print("-" * 40)
-    try:
-        result = walkforward_train(
-            df,
-            features,
-            train_months=[202401, 202402, 202403, 202404, 202405, 202406],
-            valid_month=202407,
-            test_month=202410,
-        )
-        all_results.append(result)
-    except Exception as e:
-        print(f"Fold 0 失败: {e}")
+    # 2个最近Fold验证
+    fold_configs = [
+        # Fold 2: 训练2024-03~2025-06, 验证2025-07, 测试2025-08
+        (
+            [
+                202403,
+                202404,
+                202405,
+                202406,
+                202407,
+                202408,
+                202409,
+                202410,
+                202411,
+                202412,
+                202501,
+                202502,
+                202503,
+                202504,
+                202505,
+                202506,
+            ],
+            202507,
+            202508,
+            0,
+        ),
+        # Fold 3: 训练2024-03~2025-08, 验证2025-09, 测试2025-10
+        (
+            [
+                202403,
+                202404,
+                202405,
+                202406,
+                202407,
+                202408,
+                202409,
+                202410,
+                202411,
+                202412,
+                202501,
+                202502,
+                202503,
+                202504,
+                202505,
+                202506,
+                202507,
+                202508,
+            ],
+            202509,
+            202510,
+            1,
+        ),
+    ]
 
-    # Fold 1: 训练2024Q1-Q3 (1-9月), 验证2024Q4 (10-12月), 测试2025Q1 (1-3月)
-    print("\n" + "-" * 40)
-    print("Fold 1: 训练2024Q1-Q3, 验证2024Q4, 测试2025Q1")
-    print("-" * 40)
-    try:
-        result = walkforward_train(
-            df,
-            features,
-            train_months=[202401, 202402, 202403, 202404, 202405, 202406, 202407, 202408, 202409],
-            valid_month=202410,
-            test_month=202501,
-        )
-        all_results.append(result)
-    except Exception as e:
-        print(f"Fold 1 失败: {e}")
+    for train_months, valid_month, test_month, fold_idx in fold_configs:
+        print(f"\n{'=' * 40}")
+        print(f"Fold {fold_idx}: 训练2024-03~... ({len(train_months)}个月), 验证{valid_month}, 测试{test_month}")
+        print("=" * 40)
+        try:
+            result = walkforward_train(
+                df,
+                features,
+                train_months=train_months,
+                valid_month=valid_month,
+                test_month=test_month,
+                fold_index=fold_idx,
+            )
+            all_results.append(result)
+        except Exception as e:
+            print(f"Fold {fold_idx} 失败: {e}")
 
     if not all_results:
         print("错误: 没有有效的训练结果")
         return
 
     # 打印汇总
-    print("\n" + "=" * 80)
-    print("RESULTS SUMMARY")
-    print("=" * 80)
+    print("\n" + "=" * 100)
+    print("RESULTS SUMMARY (18项概率 + 方向反了狠狠惩罚)")
+    print("=" * 100)
 
-    print(f"\n{'Fold':<6} {'Period':<20} {'Acc':<8} {'MacroF1':<8} {'LongR':<8} {'ShortR':<8}")
-    print("-" * 60)
+    # 表头
+    print(
+        f"\n{'Fold':<6} {'Test':<10} {'Composite':<12} {'MacroF1':<10} {'LongR':<8} {'ShortR':<8} {'P(aS|pL)':<10} {'P(aL|pS)':<10}"
+    )
+    print("-" * 80)
     for i, r in enumerate(all_results):
         period = f"{r['test_month']}"
+        comp = r.get("composite_score_post", 0)
+        p_as_pl = r.get("P_aS_pL", 0)  # 预测L实际S
+        p_al_ps = r.get("P_aL_pS", 0)  # 预测S实际L
         print(
-            f"{i:<6} {period:<20} "
-            f"{r['accuracy_post']:<8.3f} "
-            f"{r['macro_f1_post']:<8.3f} "
+            f"{i:<6} {period:<10} "
+            f"{comp:<12.4f} "
+            f"{r['macro_f1_post']:<10.3f} "
             f"{r['long_recall']:<8.3f} "
-            f"{r['short_recall']:<8.3f}"
+            f"{r['short_recall']:<8.3f} "
+            f"{p_as_pl:<10.4f} "
+            f"{p_al_ps:<10.4f}"
         )
 
     # 平均
+    avg_comp = np.mean([r.get("composite_score_post", 0) for r in all_results])
     avg_macro_f1 = np.mean([r["macro_f1_post"] for r in all_results])
     avg_long_recall = np.mean([r["long_recall"] for r in all_results])
     avg_short_recall = np.mean([r["short_recall"] for r in all_results])
+    avg_p_as_pl = np.mean([r.get("P_aS_pL", 0) for r in all_results])
+    avg_p_al_ps = np.mean([r.get("P_aL_pS", 0) for r in all_results])
 
-    print("-" * 60)
-    print(f"{'AVG':<6} {'':<20} {'':8} {avg_macro_f1:<8.3f} {avg_long_recall:<8.3f} {avg_short_recall:<8.3f}")
+    print("-" * 80)
+    print(
+        f"{'AVG':<6} {'':<10} {avg_comp:<12.4f} {avg_macro_f1:<10.3f} {avg_long_recall:<8.3f} {avg_short_recall:<8.3f} {avg_p_as_pl:<10.4f} {avg_p_al_ps:<10.4f}"
+    )
+
+    # ========== 详细 18 项概率 ==========
+    print("\n" + "=" * 100)
+    print("18项概率详情")
+    print("=" * 100)
+
+    # P(actual|predicted) 矩阵
+    print("\nP(actual|predicted) — 列归一化 (Precision):")
+    print("         预测L     预测N     预测S")
+    for cls, name in [("实际L", "DOWN"), ("实际N", "NEUTRAL"), ("实际S", "UP")]:
+        p_al = all_results[0].get(
+            f"P_aL_p{'L' if cls == '实际L' else 'N' if cls == '实际N' else 'S'}".lower().replace("_", ""), 0
+        )
+        # 简化输出
+        pass
+
+    print("\n最后一Fold的概率详情:")
+    r = all_results[-1]
+    print(f"\n  P(actual|predicted):")
+    print(
+        f"    预测L: 实际L={r.get('P_aL_pL', 0):.3f}, 实际N={r.get('P_aN_pL', 0):.3f}, 实际S={r.get('P_aS_pL', 0):.3f}"
+    )
+    print(
+        f"    预测N: 实际L={r.get('P_aL_pN', 0):.3f}, 实际N={r.get('P_aN_pN', 0):.3f}, 实际S={r.get('P_aS_pN', 0):.3f}"
+    )
+    print(
+        f"    预测S: 实际L={r.get('P_aL_pS', 0):.3f}, 实际N={r.get('P_aN_pS', 0):.3f}, 实际S={r.get('P_aS_pS', 0):.3f}"
+    )
+
+    print(f"\n  P(predicted|actual):")
+    print(
+        f"    实际L: 预测L={r.get('P_pL_aL', 0):.3f}, 预测N={r.get('P_pN_aL', 0):.3f}, 预测S={r.get('P_pS_aL', 0):.3f}"
+    )
+    print(
+        f"    实际N: 预测L={r.get('P_pL_aN', 0):.3f}, 预测N={r.get('P_pN_aN', 0):.3f}, 预测S={r.get('P_pS_aN', 0):.3f}"
+    )
+    print(
+        f"    实际S: 预测L={r.get('P_pL_aS', 0):.3f}, 预测N={r.get('P_pN_aS', 0):.3f}, 预测S={r.get('P_pS_aS', 0):.3f}"
+    )
 
     # 保存结果
     output_path = Path("models/walkforward_lstm_results.json")
