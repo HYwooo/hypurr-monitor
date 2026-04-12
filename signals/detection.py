@@ -175,11 +175,10 @@ async def update_klines(  # noqa: PLR0913, PLR0912
     try:
         is_pair = is_pair_trading_fn(symbol)
         if is_pair:
-            klines = await (fetch_pair_klines_fn or fetch_pair_klines)(
+            klines = await (fetch_pair_klines_fn or fetch_klines)(
                 symbol,
+                proxy=proxy,
                 kline_cache=kline_cache,
-                fetch_klines_fn=fetch_klines_fn,
-                exchange_id=exchange_id,
             )
             if klines:
                 kline_cache[symbol] = klines
