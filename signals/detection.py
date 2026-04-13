@@ -173,9 +173,10 @@ async def update_klines(  # noqa: PLR0913, PLR0912
         exchange_id: Exchange ID (deprecated, unused)
     """
     try:
+        _ = exchange_id
         is_pair = is_pair_trading_fn(symbol)
         if is_pair:
-            klines = await (fetch_pair_klines_fn or fetch_klines)(
+            klines = await (fetch_pair_klines_fn or fetch_pair_klines)(
                 symbol,
                 proxy=proxy,
                 kline_cache=kline_cache,
@@ -262,18 +263,14 @@ async def recalculate_states(  # noqa: PLR0913
         atr1h_period/ma_type/mult: 1h ATR Channel parameters
         atr15m_period/ma_type/mult: 15m ATR Channel parameters (for trailing stop)
     """
+    _ = is_pair_trading
     klines = kline_cache.get(symbol, [])
     if len(klines) < MIN_KLINES:
         return
     with suppress(Exception):
         close = np.array([float(k.close) for k in klines], dtype=float)
-        if is_pair_trading:
-            open_arr = np.array([float(k.open) for k in klines], dtype=float)
-            high = np.maximum(open_arr, close)
-            low = np.minimum(open_arr, close)
-        else:
-            high = np.array([float(k.high) for k in klines], dtype=float)
-            low = np.array([float(k.low) for k in klines], dtype=float)
+        high = np.array([float(k.high) for k in klines], dtype=float)
+        low = np.array([float(k.low) for k in klines], dtype=float)
 
         if debug:
             invalid_mask = (high == 0) | (low == 0) | (close == 0) | np.isnan(high) | np.isnan(low) | np.isnan(close)

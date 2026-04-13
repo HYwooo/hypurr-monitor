@@ -7,6 +7,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from models import Kline
+from service.notification_service import (
+    NotificationService,
+    aggregate_pair_15m_to_1h,
+    build_pair_15m_klines,
+)
 from signals.detection import (
     PRECISION_EPSILON,
     check_signals,
@@ -373,6 +378,115 @@ class TestCheckSignals:
         assert trailing_stop["BTC"]["active"] is True
 
 
+class TestPairATRKlines:
+    """Test pair ATR synthetic kline generation."""
+
+    def test_build_pair_15m_klines(self) -> None:
+        """Pair 15m klines should be built from aligned leg open/close ratios."""
+        klines1 = [
+            Kline("LEG1", "15m", 0, 100.0, 101.0, 99.0, 102.0, 10.0, 899999, True),
+            Kline("LEG1", "15m", 900000, 102.0, 103.0, 101.0, 104.0, 12.0, 1799999, True),
+        ]
+        klines2 = [
+            Kline("LEG2", "15m", 0, 50.0, 51.0, 49.0, 51.0, 20.0, 899999, True),
+            Kline("LEG2", "15m", 900000, 51.0, 52.0, 50.0, 52.0, 22.0, 1799999, True),
+        ]
+
+        result = build_pair_15m_klines("LEG1-LEG2", klines1, klines2)
+
+        assert len(result) == 2
+        assert result[0].open == 2.0
+        assert result[0].close == 2.0
+        assert result[1].open == 2.0
+        assert result[1].close == 2.0
+        assert result[0].high == 2.0
+        assert result[0].low == 2.0
+
+    def test_aggregate_pair_15m_to_1h(self) -> None:
+        """Four 15m pair klines should aggregate into one 1h kline."""
+        klines_15m = [
+            Kline("PAIR", "15m", 0, 2.0, 2.1, 1.9, 2.05, 1.0, 899999, True),
+            Kline("PAIR", "15m", 900000, 2.05, 2.2, 2.0, 2.1, 1.0, 1799999, True),
+            Kline("PAIR", "15m", 1800000, 2.1, 2.15, 2.05, 2.08, 1.0, 2699999, True),
+            Kline("PAIR", "15m", 2700000, 2.08, 2.3, 2.0, 2.25, 1.0, 3599999, True),
+        ]
+
+        result = aggregate_pair_15m_to_1h("PAIR", klines_15m)
+
+        assert len(result) == 1
+        assert result[0].open == 2.0
+        assert result[0].close == 2.25
+        assert result[0].high == 2.3
+        assert result[0].low == 1.9
+
+
+class TestNotificationServiceATRMode:
+    """Test ATR mode switching and trailing refresh."""
+
+    def _write_config(self, tmp_path: Any, clustering_enabled: bool) -> str:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "[webhook]",
+                    'url = "https://example.com/hook"',
+                    'format = "card"',
+                    "",
+                    "[symbols]",
+                    "single_list = []",
+                    'pair_list = ["AAA-BBB"]',
+                    "",
+                    "[service]",
+                    'heartbeat_file = "heartbeat"',
+                    "",
+                    "[clustering_st]",
+                    f"enabled = {str(clustering_enabled).lower()}",
+                    "",
+                    "[settings]",
+                    'timezone = "+08:00"',
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return str(config_path)
+
+    def test_pair_uses_atr_path_when_clustering_disabled(self, tmp_path: Any) -> None:
+        """Pair should stop using clustering path when config disables it."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        assert service._use_clustering_for_symbol("AAA-BBB") is False
+
+    @pytest.mark.asyncio
+    async def test_refresh_trailing_stop_channel_uses_full_15m_history(self, tmp_path: Any) -> None:
+        """Trailing stop refresh should rebuild ATR channel from fetched 15m history."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        service.atr15m_period = 2
+        service.atr15m_ma_type = "EMA"
+        service.trailing_stop["AAA-BBB"] = {
+            "direction": "LONG",
+            "entry_price": 2.0,
+            "atr_mult": 1.3,
+            "atr15m_upper": 0.0,
+            "atr15m_lower": 0.0,
+            "atr15m_state": (float("nan"), float("nan"), 0),
+            "active": True,
+        }
+
+        async def mock_fetch(_symbol: str, limit: int = 500) -> list[Kline]:
+            return [
+                Kline("AAA-BBB", "15m", 0, 2.0, 2.1, 1.9, 2.05, 1.0, 899999, True),
+                Kline("AAA-BBB", "15m", 900000, 2.05, 2.2, 2.0, 2.1, 1.0, 1799999, True),
+                Kline("AAA-BBB", "15m", 1800000, 2.1, 2.2, 2.05, 2.18, 1.0, 2699999, True),
+                Kline("AAA-BBB", "15m", 2700000, 2.18, 2.25, 2.1, 2.2, 1.0, 3599999, True),
+                Kline("AAA-BBB", "15m", 3600000, 2.2, 2.3, 2.15, 2.28, 1.0, 4499999, True),
+            ]
+
+        service._fetch_15m_klines = mock_fetch  # type: ignore[method-assign]
+        await service._refresh_trailing_stop_channel("AAA-BBB", force=True)
+
+        assert service.trailing_stop["AAA-BBB"]["atr15m_upper"] > 0
+        assert service.trailing_stop["AAA-BBB"]["atr15m_lower"] > 0
+
+
 class TestCheckTrailingStop:
     """Test trailing stop logic."""
 
@@ -550,7 +664,7 @@ class TestUpdateKlines:
         kline_cache: dict[str, Any] = {}
         last_kline_time: dict[str, Any] = {}
 
-        async def false_is_pair(_sym: str) -> bool:
+        def false_is_pair(_sym: str) -> bool:
             return False
 
         async def false_fetch(_sym: str, *, proxy: str | None = None) -> None:
