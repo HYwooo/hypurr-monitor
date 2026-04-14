@@ -2,7 +2,8 @@
 Logging configuration module.
 
 Provides ISO timestamp (millisecond) + level + location + message format.
-Debug mode outputs to both console and file, normal mode outputs to console only.
+Debug mode outputs to console + debug.log, normal mode outputs to console only,
+and ERROR logs are always written to error.log.
 """
 
 import logging
@@ -126,6 +127,7 @@ class ColoredFormatter(logging.Formatter):
 
 
 _logger_initialized = False
+ERROR_LOG_FILE = "error.log"
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -133,7 +135,7 @@ def setup_logging(debug: bool = False) -> None:
     Setup logging with ISO formatter.
 
     Args:
-        debug: If True, DEBUG level to both console and file (debug.log)
+        debug: If True, DEBUG level to console and debug.log
                If False, INFO level to console only
     """
     global _logger_initialized  # noqa: PLW0603
@@ -147,6 +149,11 @@ def setup_logging(debug: bool = False) -> None:
     console.setLevel(logging.DEBUG if debug else logging.INFO)
     console.setFormatter(ColoredFormatter())
     root.addHandler(console)
+
+    error_handler = logging.FileHandler(ERROR_LOG_FILE, encoding="utf-8")
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(ISOFormatter())
+    root.addHandler(error_handler)
 
     if debug:
         file_handler = logging.FileHandler("debug.log", encoding="utf-8")

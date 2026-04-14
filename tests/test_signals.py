@@ -4,12 +4,15 @@ import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
+import orjson
 import pytest
 
 from models import Kline
 from service.notification_service import (
     NotificationService,
     aggregate_pair_15m_to_1h,
+    aggregate_pair_15m_to_4h,
     build_pair_15m_klines,
 )
 from signals.detection import (
@@ -419,11 +422,38 @@ class TestPairATRKlines:
         assert result[0].high == 2.3
         assert result[0].low == 1.9
 
+    def test_aggregate_pair_15m_to_4h(self) -> None:
+        """Sixteen 15m pair klines should aggregate into one 4h kline."""
+        klines_15m = [
+            Kline(
+                "PAIR",
+                "15m",
+                i * 900000,
+                2.0 + i * 0.01,
+                2.05 + i * 0.01,
+                1.95 + i * 0.01,
+                2.02 + i * 0.01,
+                1.0,
+                (i + 1) * 900000 - 1,
+                True,
+            )
+            for i in range(16)
+        ]
+
+        result = aggregate_pair_15m_to_4h("PAIR", klines_15m)
+
+        assert len(result) == 1
+        assert result[0].interval == "4h"
+        assert result[0].open == 2.0
+        assert result[0].close == pytest.approx(2.17)
+        assert result[0].high == pytest.approx(2.2)
+        assert result[0].low == 1.95
+
 
 class TestNotificationServiceATRMode:
     """Test ATR mode switching and trailing refresh."""
 
-    def _write_config(self, tmp_path: Any, clustering_enabled: bool) -> str:
+    def _write_config(self, tmp_path: Any, clustering_enabled: bool, heartbeat_timeout: int = 120) -> str:
         config_path = tmp_path / "config.toml"
         config_path.write_text(
             "\n".join(
@@ -438,6 +468,7 @@ class TestNotificationServiceATRMode:
                     "",
                     "[service]",
                     'heartbeat_file = "heartbeat"',
+                    f"heartbeat_timeout = {heartbeat_timeout}",
                     "",
                     "[clustering_st]",
                     f"enabled = {str(clustering_enabled).lower()}",
@@ -485,6 +516,217 @@ class TestNotificationServiceATRMode:
 
         assert service.trailing_stop["AAA-BBB"]["atr15m_upper"] > 0
         assert service.trailing_stop["AAA-BBB"]["atr15m_lower"] > 0
+
+    @pytest.mark.asyncio
+    async def test_pair_symbol_not_checked_twice_in_ws_loop(self, tmp_path: Any) -> None:
+        """Pair symbol should only run signal detection once per WS batch."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+
+        class FakeWSMessage:
+            def __init__(self, msg_type: Any, data: str = "") -> None:
+                self.type = msg_type
+                self.data = data
+
+        class FakeWS:
+            def __init__(self, messages: list[FakeWSMessage]) -> None:
+                self._messages = messages
+
+            async def receive(self) -> FakeWSMessage:
+                return self._messages.pop(0)
+
+        payload = {
+            "channel": "allMids",
+            "data": {
+                "mids": {
+                    "AAA": "2.0",
+                    "BBB": "1.0",
+                    "AAA-BBB": "2.0",
+                }
+            },
+        }
+        service._hl_ws = FakeWS(
+            [
+                FakeWSMessage(msg_type=aiohttp.WSMsgType.TEXT, data=orjson.dumps(payload).decode()),
+                FakeWSMessage(msg_type=aiohttp.WSMsgType.CLOSED),
+            ]
+        )
+        service._hl_ws_running = True
+        service._log_symbol_state = MagicMock()
+        service._maybe_refresh_runtime_atr = AsyncMock()
+        service._maybe_refresh_runtime_atr_4h = AsyncMock()
+        service._refresh_trailing_stop_channel = AsyncMock()
+        service._ct_check_trailing_stop = AsyncMock()
+        service._ct_check_signals = AsyncMock()
+        service._ct_check_signals_clustering = AsyncMock()
+        service._ct_check_signals_4h = AsyncMock()
+        service._reconnect_hyperliquid_ws = AsyncMock(return_value=False)
+
+        await service._watch_hyperliquid_marks()
+
+        service._ct_check_signals.assert_called_once_with("AAA-BBB")
+
+    @pytest.mark.asyncio
+    async def test_watch_marks_sends_ping_on_idle_timeout(self, tmp_path: Any, monkeypatch: Any) -> None:
+        """Watcher should send ping when receive loop is idle."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+
+        class FakeWSMessage:
+            def __init__(self, msg_type: Any) -> None:
+                self.type = msg_type
+                self.data = ""
+
+        service._hl_ws_running = True
+        fake_ws = MagicMock()
+        fake_ws.receive = AsyncMock()
+        fake_ws.send_json = AsyncMock()
+        service._hl_ws = fake_ws
+        service._reconnect_hyperliquid_ws = AsyncMock(return_value=False)
+
+        calls = {"count": 0}
+
+        async def fake_wait_for(_awaitable: Any, timeout: float) -> Any:
+            _ = timeout
+            calls["count"] += 1
+            close_coro = getattr(_awaitable, "close", None)
+            if callable(close_coro):
+                close_coro()
+            if calls["count"] == 1:
+                raise TimeoutError
+            return FakeWSMessage(aiohttp.WSMsgType.CLOSED)
+
+        monkeypatch.setattr("service.notification_service.asyncio.wait_for", fake_wait_for)
+
+        await service._watch_hyperliquid_marks()
+
+        fake_ws.send_json.assert_called_once_with({"method": "ping"})
+
+    @pytest.mark.asyncio
+    async def test_reconnect_ws_retries_until_success(self, tmp_path: Any, monkeypatch: Any) -> None:
+        """Reconnect helper should retry with backoff until websocket reconnects."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        service._hl_ws_running = True
+        service._close_hyperliquid_ws = AsyncMock()
+        service._send_webhook = AsyncMock()
+
+        attempts = {"count": 0}
+
+        async def fake_connect(*, start_watch_task: bool = True) -> None:
+            _ = start_watch_task
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise ConnectionError("temporary")
+
+        monkeypatch.setattr(service, "_connect_hyperliquid_ws", fake_connect)
+        monkeypatch.setattr("service.notification_service.asyncio.sleep", AsyncMock())
+
+        assert await service._reconnect_hyperliquid_ws("test") is True
+        assert attempts["count"] == 2
+        service._send_webhook.assert_any_call("ERROR", "Hyperliquid WS disconnected: test. Reconnecting...")
+        service._send_webhook.assert_any_call("SYSTEM", "Hyperliquid WS reconnected after test (attempt 2)")
+
+    @pytest.mark.asyncio
+    async def test_check_signals_4h_sends_alert(self, tmp_path: Any) -> None:
+        """4H ATR breakout should emit webhook without creating trailing stop."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        service._initialized = True
+        service.mark_prices["AAA-BBB"] = 2.3
+        service.mark_price_times["AAA-BBB"] = time.time()
+        service.benchmark["AAA-BBB"] = {
+            "atr4h_upper": 2.2,
+            "atr4h_lower": 2.0,
+            "atr4h_natrr": 0.05,
+        }
+        service._send_webhook = AsyncMock()
+
+        await service._ct_check_signals_4h("AAA-BBB")
+
+        service._send_webhook.assert_called_once()
+        args, _ = service._send_webhook.call_args
+        assert args[0] == "ATR_Ch"
+        assert args[1] == "[AAA-BBB] 4H LONG"
+        assert args[2]["timeframe"] == "4H"
+        assert "AAA-BBB" not in service.trailing_stop
+
+    @pytest.mark.asyncio
+    async def test_check_ws_data_silence_triggers_reconnect(self, tmp_path: Any) -> None:
+        """Data silence beyond heartbeat_timeout should trigger reconnect."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False, heartbeat_timeout=90))
+        service._last_ws_data_time = 100.0
+        service._reconnect_hyperliquid_ws = AsyncMock(return_value=True)
+        service._send_webhook = AsyncMock()
+
+        result = await service._check_ws_data_silence(now=191.0)
+
+        assert result is True
+        service._send_webhook.assert_any_call("ERROR", "Hyperliquid market data silent for 91s. Reconnecting...")
+        service._reconnect_hyperliquid_ws.assert_awaited_once_with("market data silence > 90s (last 91s ago)")
+
+    @pytest.mark.asyncio
+    async def test_notify_ws_data_recovered_sends_system_webhook(self, tmp_path: Any) -> None:
+        """Data recovery after silence should send a SYSTEM webhook once."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        service._send_webhook = AsyncMock()
+        service._ws_silence_alert_active = True
+        service._ws_silence_started_at = 100.0
+
+        await service._notify_ws_data_recovered(recovered_at=145.0)
+
+        service._send_webhook.assert_awaited_once_with(
+            "SYSTEM",
+            "Hyperliquid market data resumed after 45s silence",
+        )
+        assert service._ws_silence_alert_active is False
+
+    @pytest.mark.asyncio
+    async def test_watch_marks_updates_heartbeat_on_allmids(self, tmp_path: Any) -> None:
+        """Receiving allMids data should refresh heartbeat file and data timestamp."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        heartbeat_path = tmp_path / "hb.txt"
+        service.heartbeat_file = str(heartbeat_path)
+
+        class FakeWSMessage:
+            def __init__(self, msg_type: Any, data: str = "") -> None:
+                self.type = msg_type
+                self.data = data
+
+        class FakeWS:
+            def __init__(self, messages: list[FakeWSMessage]) -> None:
+                self._messages = messages
+
+            async def receive(self) -> FakeWSMessage:
+                return self._messages.pop(0)
+
+        payload = {
+            "channel": "allMids",
+            "data": {
+                "mids": {
+                    "AAA": "2.0",
+                    "BBB": "1.0",
+                }
+            },
+        }
+        service._hl_ws = FakeWS(
+            [
+                FakeWSMessage(msg_type=aiohttp.WSMsgType.TEXT, data=orjson.dumps(payload).decode()),
+                FakeWSMessage(msg_type=aiohttp.WSMsgType.CLOSED),
+            ]
+        )
+        service._hl_ws_running = True
+        service._log_symbol_state = MagicMock()
+        service._maybe_refresh_runtime_atr = AsyncMock()
+        service._maybe_refresh_runtime_atr_4h = AsyncMock()
+        service._refresh_trailing_stop_channel = AsyncMock()
+        service._ct_check_trailing_stop = AsyncMock()
+        service._ct_check_signals = AsyncMock()
+        service._ct_check_signals_clustering = AsyncMock()
+        service._ct_check_signals_4h = AsyncMock()
+        service._reconnect_hyperliquid_ws = AsyncMock(return_value=False)
+
+        await service._watch_hyperliquid_marks()
+
+        assert heartbeat_path.exists()
+        assert int(heartbeat_path.read_text(encoding="utf-8").strip()) > 0
+        assert service._last_ws_data_time > 0
 
 
 class TestCheckTrailingStop:

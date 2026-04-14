@@ -15,6 +15,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -50,16 +51,42 @@ def is_running(pid: int) -> bool:
         return False
 
 
-def cmd_daemon() -> None:
+def _get_heartbeat_status(config_path: str) -> tuple[bool, str]:
+    """Check heartbeat file freshness from config."""
+    config = load_config(config_path)
+    service_config = config.get("service", {})
+    heartbeat_file = str(service_config.get("heartbeat_file", "heartbeat"))
+    heartbeat_timeout = int(service_config.get("heartbeat_timeout", 120))
+
+    heartbeat_path = Path(heartbeat_file)
+    if not heartbeat_path.is_absolute():
+        heartbeat_path = Path(config_path).resolve().parent / heartbeat_path
+
+    if not heartbeat_path.exists():
+        return False, f"heartbeat file missing: {heartbeat_path}"
+
+    try:
+        heartbeat_ts = int(heartbeat_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False, f"heartbeat file invalid: {heartbeat_path}"
+
+    age = int(time.time()) - heartbeat_ts
+    if age > heartbeat_timeout:
+        return False, f"heartbeat stale: {age}s > {heartbeat_timeout}s"
+    return True, f"heartbeat OK: {age}s <= {heartbeat_timeout}s"
+
+
+def cmd_daemon(config_path: str) -> None:
     pid = read_pid()
     if pid and is_running(pid):
         print(f"hypurr-monitor is already running (PID: {pid})")
         sys.exit(1)
 
     print("Starting hypurr-monitor in background...")
+    Path(LOG_FILE).write_text("", encoding="utf-8")
     with Path(LOG_FILE).open("a", encoding="utf-8") as log:
         proc = subprocess.Popen(
-            [sys.executable, __file__, "--config", "config.toml", "--debug"],
+            [sys.executable, __file__, "--config", config_path, "--debug"],
             stdout=log,
             stderr=log,
             start_new_session=True,
@@ -76,7 +103,7 @@ def cmd_stop() -> None:
         sys.exit(1)
 
     if not is_running(pid):
-        print("hypurr-monitor is not running (stale PID file)")
+        print(f"hypurr-monitor is not running (stale PID file: {pid})")
         Path(PID_FILE).unlink(missing_ok=True)
         sys.exit(1)
 
@@ -89,14 +116,19 @@ def cmd_stop() -> None:
         sys.exit(1)
 
 
-def cmd_status() -> None:
+def cmd_status(config_path: str) -> None:
     pid = read_pid()
     if not pid:
         print("hypurr-monitor is NOT running")
         sys.exit(1)
 
     if is_running(pid):
-        print(f"hypurr-monitor is RUNNING (PID: {pid})")
+        heartbeat_ok, heartbeat_message = _get_heartbeat_status(config_path)
+        if heartbeat_ok:
+            print(f"hypurr-monitor is RUNNING (PID: {pid}), {heartbeat_message}")
+            return
+        print(f"hypurr-monitor is RUNNING (PID: {pid}), but {heartbeat_message}")
+        sys.exit(1)
     else:
         print("hypurr-monitor is NOT running (stale PID file)")
         sys.exit(1)
@@ -135,13 +167,13 @@ async def main() -> None:
     args = parser.parse_args()
 
     if args.daemon:
-        cmd_daemon()
+        cmd_daemon(args.config)
         return
     if args.stop:
         cmd_stop()
         return
     if args.status:
-        cmd_status()
+        cmd_status(args.config)
         return
 
     setup_logging(debug=args.debug)

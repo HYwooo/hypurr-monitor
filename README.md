@@ -62,13 +62,22 @@ python main.py --config config.toml --add-symbol BTC,ETH
 python main.py --config config.toml --list-symbols
 
 # 后台运行（Linux/macOS）
-python main.py --daemon
+bash scripts/daemon.sh start
 
 # 停止后台进程
-python main.py --stop
+bash scripts/daemon.sh stop
 
-# 查看状态
-python main.py --status
+# 查看状态（包含 heartbeat 健康检查）
+bash scripts/daemon.sh status
+
+# 快速健康检查（同样检查 heartbeat）
+bash scripts/daemon.sh test
+
+# 查看最近日志
+bash scripts/daemon.sh log
+
+# 或继续使用 Python 命令查看状态
+python main.py --config config.toml --status
 ```
 
 ## Configuration
@@ -145,6 +154,12 @@ max_log_lines = 1000
 ```
 
 ## Indicators
+
+## Daemon Health
+
+- 进程存活：通过 `hypurr-monitor.pid` 检查
+- 数据流健康：通过 `service.heartbeat_file` 检查最近一次有效 `allMids` 时间戳
+- 若 heartbeat 超过 `service.heartbeat_timeout` 秒未更新，则 `status/test` 会返回非健康
 
 ### ATR Channel
 基于 1h ATR 的动态支撑/阻力通道，突破上轨做多，突破下轨做空，带 15m ATR 追踪止损。

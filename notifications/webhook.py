@@ -100,6 +100,7 @@ def build_feishu_card(  # noqa: PLR0912, PLR0915
         atr_lower = extra.get("atr_lower", "")
         stop_line = extra.get("stop_line", "")
         entry_price = extra.get("entry_price", "")
+        timeframe = extra.get("timeframe", "")
 
         if is_trailing:
             elements = [
@@ -116,6 +117,8 @@ def build_feishu_card(  # noqa: PLR0912, PLR0915
                 {"tag": "markdown", "content": f"**Direction:** {direction.upper()}"},
                 {"tag": "markdown", "content": f"**Price:** {price}"},
             ]
+        if timeframe and not is_trailing:
+            elements.append({"tag": "markdown", "content": f"**Timeframe:** {timeframe}"})
         if stop_line:
             elements.append({"tag": "markdown", "content": f"**Stop Line:** {stop_line}"})
         if atr_upper and atr_lower and not is_trailing:

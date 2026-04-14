@@ -5,6 +5,7 @@ Main notification service - coordinates all modules, manages WebSocket and signa
 import asyncio
 import threading
 import time
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -42,9 +43,18 @@ logger = get_logger(__name__)
 
 WEBHOOK_LOG_FILE = "webhook.log"
 PAIR_15M_PER_1H = 4
+PAIR_15M_PER_4H = 16
 ATR_REFRESH_THROTTLE_SECONDS = 60
+ATR_4H_REFRESH_THROTTLE_SECONDS = 300
 TRAILING_REFRESH_THROTTLE_SECONDS = 30
 MIN_TRAILING_KLINES = 2
+WS_RECEIVE_IDLE_TIMEOUT_SECONDS = 25
+WS_RECONNECT_BASE_DELAY_SECONDS = 2
+WS_RECONNECT_MAX_DELAY_SECONDS = 30
+WS_CONNECT_RECEIVE_TIMEOUT_SECONDS = 65
+PRICE_STALE_THRESHOLD_SECONDS = 300
+ATR_BREAKOUT_COOLDOWN_SECONDS = 3600
+HEARTBEAT_WRITE_THROTTLE_SECONDS = 5
 
 
 def build_pair_15m_klines(symbol: str, klines1: list[Kline], klines2: list[Kline]) -> list[Kline]:
@@ -81,24 +91,30 @@ def build_pair_15m_klines(symbol: str, klines1: list[Kline], klines2: list[Kline
     return sorted(merged, key=lambda x: x.open_time)
 
 
-def aggregate_pair_15m_to_1h(symbol: str, klines_15m: list[Kline]) -> list[Kline]:
-    """Aggregate synthetic pair 15m klines into 1h klines."""
+def aggregate_pair_15m_klines(
+    symbol: str,
+    klines_15m: list[Kline],
+    bars_per_bucket: int,
+    bucket_ms: int,
+    interval: str,
+) -> list[Kline]:
+    """Aggregate synthetic pair 15m klines into a higher timeframe."""
     if not klines_15m:
         return []
     grouped: dict[int, list[Kline]] = {}
     for kline in klines_15m:
-        bucket = int(kline.open_time) // 3_600_000
+        bucket = int(kline.open_time) // bucket_ms
         grouped.setdefault(bucket, []).append(kline)
 
     aggregated: list[Kline] = []
     for _, group in sorted(grouped.items()):
         ordered = sorted(group, key=lambda x: x.open_time)
-        if len(ordered) < PAIR_15M_PER_1H:
+        if len(ordered) < bars_per_bucket:
             continue
         aggregated.append(
             Kline(
                 symbol=symbol,
-                interval="1h",
+                interval=interval,
                 open_time=int(ordered[0].open_time),
                 open=float(ordered[0].open),
                 high=max(float(k.high) for k in ordered),
@@ -110,6 +126,16 @@ def aggregate_pair_15m_to_1h(symbol: str, klines_15m: list[Kline]) -> list[Kline
             )
         )
     return aggregated
+
+
+def aggregate_pair_15m_to_1h(symbol: str, klines_15m: list[Kline]) -> list[Kline]:
+    """Aggregate synthetic pair 15m klines into 1h klines."""
+    return aggregate_pair_15m_klines(symbol, klines_15m, PAIR_15M_PER_1H, 3_600_000, "1h")
+
+
+def aggregate_pair_15m_to_4h(symbol: str, klines_15m: list[Kline]) -> list[Kline]:
+    """Aggregate synthetic pair 15m klines into 4h klines."""
+    return aggregate_pair_15m_klines(symbol, klines_15m, PAIR_15M_PER_4H, 14_400_000, "4h")
 
 
 class NotificationService:
@@ -151,6 +177,9 @@ class NotificationService:
         self.atr1h_ma_type = self.config.get("atr_1h", {}).get("ma_type", "DEMA")
         self.atr1h_period = self.config.get("atr_1h", {}).get("period", 14)
         self.atr1h_mult = self.config.get("atr_1h", {}).get("mult", 1.618)
+        self.atr4h_ma_type = self.config.get("atr_4h", {}).get("ma_type", self.atr1h_ma_type)
+        self.atr4h_period = self.config.get("atr_4h", {}).get("period", self.atr1h_period)
+        self.atr4h_mult = self.config.get("atr_4h", {}).get("mult", self.atr1h_mult)
         self.atr15m_ma_type = self.config.get("atr_15m", {}).get("ma_type", "HMA")
         self.atr15m_period = self.config.get("atr_15m", {}).get("period", 14)
         self.atr15m_mult = self.config.get("atr_15m", {}).get("mult", 1.3)
@@ -166,6 +195,7 @@ class NotificationService:
         self.clustering_history_klines = cs_config.get("history_klines", 500)
 
         self.heartbeat_file = self.config["service"]["heartbeat_file"]
+        self.heartbeat_timeout = int(self.config.get("service", {}).get("heartbeat_timeout", 120))
         self.proxy_enable = self.config.get("proxy", {}).get("enable", False)
         self.proxy_url = self.config.get("proxy", {}).get("url", "")
         self.report_enable = self.config.get("report", {}).get("enable", False)
@@ -182,10 +212,12 @@ class NotificationService:
         self.mark_price_times: dict[str, float] = {}
         self._breakout_comp_prices: dict[str, float] = {}
         self.kline_cache: dict[str, list[Any]] = {}
+        self.kline_cache_4h: dict[str, list[Kline]] = {}
         self.kline_cache_15m: dict[str, list[Kline]] = {}
         self.benchmark: dict[str, dict[str, Any]] = {}
         self.last_st_state: dict[str, str] = {}
         self.last_atr_state: dict[str, dict[str, Any]] = {}
+        self.last_atr4h_state: dict[str, dict[str, Any]] = {}
         self.last_alert_time: dict[str, float] = {}
         self.last_kline_time: dict[str, int] = {}
         self.breakout_monitor: dict[str, dict[str, Any]] = {}
@@ -205,7 +237,75 @@ class NotificationService:
         self._ws_tasks: list[asyncio.Task[None]] = []
         self._logged_initial_price: set[str] = set()
         self._last_atr_refresh_attempt: dict[str, float] = {}
+        self._last_atr4h_refresh_attempt: dict[str, float] = {}
         self._last_trailing_refresh_attempt: dict[str, float] = {}
+        self._hl_ws: aiohttp.ClientWebSocketResponse | None = None
+        self._hl_session: aiohttp.ClientSession | None = None
+        self._hl_ws_running = False
+        self._ws_reconnect_alert_active = False
+        self._ws_silence_alert_active = False
+        self._ws_silence_started_at = 0.0
+        self._last_ws_message_time = 0.0
+        self._last_ws_data_time = 0.0
+        self._last_heartbeat_write_time = 0.0
+
+    def _touch_heartbeat_file(self) -> None:
+        """Persist a lightweight heartbeat timestamp for external monitors."""
+        now = time.time()
+        if now - self._last_heartbeat_write_time < HEARTBEAT_WRITE_THROTTLE_SECONDS:
+            return
+        try:
+            Path(self.heartbeat_file).write_text(f"{int(now)}\n", encoding="utf-8")
+            self._last_heartbeat_write_time = now
+        except Exception as e:
+            logger.warning("Failed to write heartbeat file %s: %s", self.heartbeat_file, e)
+
+    def _is_ws_data_silent(self, now: float | None = None) -> bool:
+        """Return whether market data stream has been silent beyond threshold."""
+        if self.heartbeat_timeout <= 0:
+            return False
+        current = now if now is not None else time.time()
+        last_data_time = self._last_ws_data_time
+        if last_data_time <= 0:
+            return False
+        return current - last_data_time > self.heartbeat_timeout
+
+    async def _check_ws_data_silence(self, now: float | None = None) -> bool:
+        """Reconnect when market data has been silent beyond heartbeat_timeout."""
+        current = now if now is not None else time.time()
+        if not self._is_ws_data_silent(current):
+            return False
+        silence_seconds = int(current - self._last_ws_data_time)
+        reason = f"market data silence > {self.heartbeat_timeout}s (last {silence_seconds}s ago)"
+        await self._notify_ws_data_silence(silence_seconds)
+        logger.error("Hyperliquid WS %s", reason)
+        return await self._reconnect_hyperliquid_ws(reason)
+
+    async def _notify_ws_data_silence(self, silence_seconds: int) -> None:
+        """Send a single webhook when market data becomes silent."""
+        if self._ws_silence_alert_active:
+            return
+        self._ws_silence_alert_active = True
+        self._ws_silence_started_at = time.time()
+        with suppress(Exception):
+            await self._send_webhook(
+                "ERROR",
+                f"Hyperliquid market data silent for {silence_seconds}s. Reconnecting...",
+            )
+
+    async def _notify_ws_data_recovered(self, recovered_at: float | None = None) -> None:
+        """Send webhook when market data resumes after silence."""
+        if not self._ws_silence_alert_active:
+            return
+        current = recovered_at if recovered_at is not None else time.time()
+        silence_duration = max(0, int(current - self._ws_silence_started_at))
+        self._ws_silence_alert_active = False
+        self._ws_silence_started_at = 0.0
+        with suppress(Exception):
+            await self._send_webhook(
+                "SYSTEM",
+                f"Hyperliquid market data resumed after {silence_duration}s silence",
+            )
 
     def _use_clustering_for_symbol(self, symbol: str) -> bool:
         """Return whether a symbol should use clustering signal path."""
@@ -235,6 +335,133 @@ class NotificationService:
             return
         self._last_atr_refresh_attempt[symbol] = now
         await self._ct_update_klines(symbol)
+
+    async def _maybe_refresh_runtime_atr_4h(self, symbol: str) -> None:
+        """Refresh 4h ATR breakout benchmark when a newer closed 4h kline should exist."""
+        expected_open_time = self._expected_closed_open_time_ms(14_400)
+        if expected_open_time <= 0:
+            return
+        klines = self.kline_cache_4h.get(symbol, [])
+        latest_open_time = int(klines[-1].open_time) if klines else 0
+        if latest_open_time >= expected_open_time:
+            return
+        now = time.time()
+        last_attempt = self._last_atr4h_refresh_attempt.get(symbol, 0.0)
+        if now - last_attempt < ATR_4H_REFRESH_THROTTLE_SECONDS:
+            return
+        self._last_atr4h_refresh_attempt[symbol] = now
+        await self._recalculate_4h_breakout_state(symbol)
+
+    async def _fetch_4h_klines(self, symbol: str, limit: int = 500) -> list[Kline]:
+        """Fetch 4h klines for single or pair symbol."""
+        proxy = self.proxy_url if self.proxy_enable else None
+        if self._is_pair_symbol(symbol):
+            klines = await self._hl_fetch_pair_klines(
+                symbol,
+                limit=limit,
+                interval="4h",
+                proxy=proxy,
+                kline_cache=self.kline_cache_4h,
+            )
+        else:
+            klines = await self._get_component_klines(symbol, "4h", limit, proxy, self.kline_cache_4h)
+        if klines:
+            self.kline_cache_4h[symbol] = klines
+        return klines
+
+    async def _recalculate_4h_breakout_state(self, symbol: str) -> None:
+        """Recalculate 4h ATR breakout state for ATR-path symbols."""
+        klines = await self._fetch_4h_klines(symbol)
+        if len(klines) < MIN_TRAILING_KLINES:
+            return
+
+        high = np.array([float(k.high) for k in klines], dtype=float)
+        low = np.array([float(k.low) for k in klines], dtype=float)
+        close = np.array([float(k.close) for k in klines], dtype=float)
+        atr4h = calculate_atr(high, low, close, self.atr4h_period, self.atr4h_ma_type)
+        atr4h_natrr = calculate_atr(high, low, close, 20, "RMA (Standard ATR)")
+        prev_state = self.benchmark.get(symbol, {}).get("atr4h_state", (float("nan"), float("nan"), 0))
+
+        for i in range(len(close)):
+            upper, lower, ch = run_atr_channel(close[i], atr4h[i], self.atr4h_mult, prev_state)
+            prev_state = (upper, lower, ch)
+
+        atr4h_upper, atr4h_lower, atr4h_ch = prev_state
+        bm = self.benchmark.setdefault(symbol, {})
+        bm.update(
+            {
+                "atr4h_upper": float(atr4h_upper) if not np.isnan(atr4h_upper) else 0,
+                "atr4h_lower": float(atr4h_lower) if not np.isnan(atr4h_lower) else 0,
+                "atr4h_ch": atr4h_ch,
+                "atr4h_state": prev_state,
+                "atr4h_raw": float(atr4h[-1]) if np.isfinite(atr4h[-1]) else 0,
+                "atr4h_natrr": float(atr4h_natrr[-1]) if np.isfinite(atr4h_natrr[-1]) else 0,
+                "atr4h_kline_time": int(klines[-1].open_time),
+            }
+        )
+
+    async def _ct_check_signals_4h(self, symbol: str) -> None:
+        """Check 4h ATR Channel breakout without affecting trailing stop state."""
+        if self._use_clustering_for_symbol(symbol):
+            return
+        current_price = self.mark_prices.get(symbol)
+        if not current_price:
+            return
+        last_update = self.mark_price_times.get(symbol, 0)
+        if time.time() - last_update > PRICE_STALE_THRESHOLD_SECONDS:
+            return
+        bm = self.benchmark.get(symbol, {})
+        atr_upper = bm.get("atr4h_upper", 0)
+        atr_lower = bm.get("atr4h_lower", 0)
+        if atr_upper <= 0 and atr_lower <= 0:
+            return
+        if not self._initialized:
+            return
+
+        now = time.time()
+        prev_state = self.last_atr4h_state.get(symbol, {"ch": 0, "sent": None})
+        natr_raw = bm.get("atr4h_natrr", 0)
+        natr = (natr_raw / current_price * 100) if current_price > 0 and natr_raw > 0 else None
+        alert_key = f"ATR_4H_{symbol}"
+
+        if current_price >= atr_upper and prev_state["ch"] != 1:
+            last_alert = self.last_alert_time.get(alert_key, 0)
+            if now - last_alert > ATR_BREAKOUT_COOLDOWN_SECONDS:
+                self.last_alert_time[alert_key] = now
+                self.last_atr4h_state[symbol] = {"ch": 1, "sent": "LONG"}
+                await self._send_webhook(
+                    "ATR_Ch",
+                    f"[{symbol}] 4H LONG",
+                    {
+                        "symbol": symbol,
+                        "direction": "LONG",
+                        "timeframe": "4H",
+                        "price": current_price,
+                        "atr_upper": atr_upper,
+                        "atr_lower": atr_lower,
+                        "natr": natr,
+                    },
+                )
+                self._increment_alert_count()
+        elif current_price <= atr_lower and prev_state["ch"] != -1:
+            last_alert = self.last_alert_time.get(alert_key, 0)
+            if now - last_alert > ATR_BREAKOUT_COOLDOWN_SECONDS:
+                self.last_alert_time[alert_key] = now
+                self.last_atr4h_state[symbol] = {"ch": -1, "sent": "SHORT"}
+                await self._send_webhook(
+                    "ATR_Ch",
+                    f"[{symbol}] 4H SHORT",
+                    {
+                        "symbol": symbol,
+                        "direction": "SHORT",
+                        "timeframe": "4H",
+                        "price": current_price,
+                        "atr_upper": atr_upper,
+                        "atr_lower": atr_lower,
+                        "natr": natr,
+                    },
+                )
+                self._increment_alert_count()
 
     async def _fetch_15m_klines(self, symbol: str, limit: int = 500) -> list[Kline]:
         """Fetch 15m klines for single or pair symbol."""
@@ -377,18 +604,10 @@ class NotificationService:
         logger.error(msg)
         raise ConnectionError(msg)
 
-    async def _connect_hyperliquid_ws(self) -> None:
-        """Connect to Hyperliquid native WebSocket for mark prices."""
-        self._hl_ws: aiohttp.ClientWebSocketResponse | None = None
-        self._hl_session: aiohttp.ClientSession | None = None
-        self._hl_ws_running = True
-
-        self._hl_session = aiohttp.ClientSession()
-        self._hl_ws = await self._hl_session.ws_connect(
-            "wss://api.hyperliquid.xyz/ws",
-            timeout=aiohttp.ClientWSTimeout(ws_receive=30),
-        )
-
+    async def _subscribe_hyperliquid_all_mids(self) -> None:
+        """Subscribe to all configured Hyperliquid allMids feeds."""
+        if not self._hl_ws:
+            raise ConnectionError("ws unavailable")  # noqa: TRY003
         for dex in ["", "xyz", "hyna", "flx", "vntl", "km", "cash", "para"]:
             if dex:
                 sub = {"method": "subscribe", "subscription": {"type": "allMids", "dex": dex}}
@@ -396,17 +615,119 @@ class NotificationService:
                 sub = {"method": "subscribe", "subscription": {"type": "allMids"}}
             await self._hl_ws.send_json(sub)
 
-        self._ws_tasks = [asyncio.create_task(self._watch_hyperliquid_marks())]
+    async def _close_hyperliquid_ws(self) -> None:
+        """Close current Hyperliquid websocket resources."""
+        ws = getattr(self, "_hl_ws", None)
+        self._hl_ws = None
+        if ws and not ws.closed:
+            await ws.close()
+
+        session = getattr(self, "_hl_session", None)
+        self._hl_session = None
+        if session and not session.closed:
+            await session.close()
+
+    async def _send_hyperliquid_ping(self) -> None:
+        """Send websocket ping heartbeat to keep connection alive."""
+        if not self._hl_ws:
+            raise ConnectionError("ws unavailable")  # noqa: TRY003
+        await self._hl_ws.send_json({"method": "ping"})
+
+    async def _notify_ws_reconnect_failure(self, reason: str) -> None:
+        """Send a single webhook when websocket enters reconnect mode."""
+        if self._ws_reconnect_alert_active:
+            return
+        self._ws_reconnect_alert_active = True
+        with suppress(Exception):
+            await self._send_webhook("ERROR", f"Hyperliquid WS disconnected: {reason}. Reconnecting...")
+
+    async def _notify_ws_reconnect_success(self, reason: str, attempt: int) -> None:
+        """Send webhook when websocket recovers from reconnect mode."""
+        if not self._ws_reconnect_alert_active:
+            return
+        self._ws_reconnect_alert_active = False
+        with suppress(Exception):
+            await self._send_webhook("SYSTEM", f"Hyperliquid WS reconnected after {reason} (attempt {attempt})")
+
+    async def _reconnect_hyperliquid_ws(self, reason: str) -> bool:
+        """Reconnect Hyperliquid websocket with exponential backoff."""
+        self.connected = False
+        delay = WS_RECONNECT_BASE_DELAY_SECONDS
+        attempt = 0
+
+        while self._hl_ws_running:
+            attempt += 1
+            await self._notify_ws_reconnect_failure(reason)
+            logger.warning("Hyperliquid WS reconnecting (%s), attempt %s", reason, attempt)
+            try:
+                await self._close_hyperliquid_ws()
+                await self._connect_hyperliquid_ws(start_watch_task=False)
+                self.connected = True
+                await self._notify_ws_reconnect_success(reason, attempt)
+                logger.info("Hyperliquid WS reconnected after %s, attempt %s", reason, attempt)
+                return True
+            except Exception as e:
+                logger.warning("Hyperliquid WS reconnect failed on attempt %s: %s", attempt, e)
+                if not self._hl_ws_running:
+                    return False
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, WS_RECONNECT_MAX_DELAY_SECONDS)
+
+        return False
+
+    async def _connect_hyperliquid_ws(self, start_watch_task: bool = True) -> None:
+        """Connect to Hyperliquid native WebSocket for mark prices."""
+        self._hl_ws_running = True
+        now = time.time()
+        self._last_ws_message_time = now
+        self._last_ws_data_time = now
+
+        self._hl_session = aiohttp.ClientSession()
+        session = self._hl_session
+        self._hl_ws = await session.ws_connect(
+            "wss://api.hyperliquid.xyz/ws",
+            timeout=aiohttp.ClientWSTimeout(ws_receive=WS_CONNECT_RECEIVE_TIMEOUT_SECONDS),
+        )
+
+        await self._subscribe_hyperliquid_all_mids()
+
+        if start_watch_task:
+            self._ws_tasks = [asyncio.create_task(self._watch_hyperliquid_marks())]
 
     async def _watch_hyperliquid_marks(self) -> None:  # noqa: PLR0912,PLR0915
         """Receive mark price updates from Hyperliquid WebSocket."""
         while self._hl_ws_running and self._hl_ws:
+            if await self._check_ws_data_silence():
+                continue
             try:
-                msg = await self._hl_ws.receive()
+                msg = await asyncio.wait_for(self._hl_ws.receive(), timeout=WS_RECEIVE_IDLE_TIMEOUT_SECONDS)
+            except TimeoutError:
+                if await self._check_ws_data_silence():
+                    continue
+                try:
+                    await self._send_hyperliquid_ping()
+                except Exception:
+                    logger.exception("Hyperliquid WS ping failed")
+                    if not await self._reconnect_hyperliquid_ws("ping timeout"):
+                        break
+                continue
+            except Exception:
+                logger.exception("Hyperliquid WS receive error")
+                if not await self._reconnect_hyperliquid_ws("receive error"):
+                    break
+                continue
+
+            try:
+                self._last_ws_message_time = time.time()
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = orjson.loads(msg.data)
                     if data.get("channel") == "allMids":
                         mids = data.get("data", {}).get("mids", {})
+                        if mids:
+                            now = time.time()
+                            self._last_ws_data_time = now
+                            await self._notify_ws_data_recovered(now)
+                            self._touch_heartbeat_file()
                         updated_symbols: set[str] = set()
                         for sym in self.symbols:
                             if sym in mids:
@@ -430,14 +751,16 @@ class NotificationService:
                             price = self.mark_prices.get(sym, 0)
                             if price <= 0:
                                 continue
-                            if not self._is_pair_trading(sym):
+                            if not self._is_pair_trading(sym) and not self._is_pair_symbol(sym):
                                 await self._maybe_refresh_runtime_atr(sym)
+                                await self._maybe_refresh_runtime_atr_4h(sym)
                             await self._refresh_trailing_stop_channel(sym)
                             await self._ct_check_trailing_stop(sym, price)
                             if self._use_clustering_for_symbol(sym):
                                 await self._ct_check_signals_clustering(sym)
-                            elif not self._is_pair_trading(sym):
+                            elif not self._is_pair_trading(sym) and not self._is_pair_symbol(sym):
                                 await self._ct_check_signals(sym)
+                                await self._ct_check_signals_4h(sym)
                         for pair_sym, (c1, c2) in self._pair_components.items():
                             p1 = self.mark_prices.get(c1, 0)
                             p2 = self.mark_prices.get(c2, 0)
@@ -450,16 +773,22 @@ class NotificationService:
                                     self._log_symbol_state(pair_sym)
                                 if not self._use_clustering_for_symbol(pair_sym):
                                     await self._maybe_refresh_runtime_atr(pair_sym)
+                                    await self._maybe_refresh_runtime_atr_4h(pair_sym)
                                     await self._refresh_trailing_stop_channel(pair_sym)
                                 await self._ct_check_trailing_stop(pair_sym, pair_price)
                                 if self._use_clustering_for_symbol(pair_sym):
                                     await self._ct_check_signals_clustering(pair_sym)
                                 else:
                                     await self._ct_check_signals(pair_sym)
+                                    await self._ct_check_signals_4h(pair_sym)
+                    elif data.get("channel") == "pong":
+                        logger.debug("Hyperliquid WS pong received")
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    break
+                    logger.warning("Hyperliquid WS closed with message type %s", msg.type.name)
+                    if not await self._reconnect_hyperliquid_ws(f"message {msg.type.name}"):
+                        break
             except Exception:
-                logger.exception("Hyperliquid WS error")
+                logger.exception("Hyperliquid WS message handling error")
 
     async def _on_ticker(self, symbol: str, ticker: dict[str, Any]) -> None:
         """Handle ticker update."""
@@ -608,19 +937,24 @@ class NotificationService:
             return []
         sym1, sym2 = pair[0], pair[1]
 
-        if interval == "1h":
+        if interval in {"1h", "4h"}:
+            bars_per_bucket = PAIR_15M_PER_1H if interval == "1h" else PAIR_15M_PER_4H
             klines1 = await self._get_component_klines(
-                sym1, "15m", limit * PAIR_15M_PER_1H, proxy, self.kline_cache_15m
+                sym1, "15m", limit * bars_per_bucket, proxy, self.kline_cache_15m
             )
             klines2 = await self._get_component_klines(
-                sym2, "15m", limit * PAIR_15M_PER_1H, proxy, self.kline_cache_15m
+                sym2, "15m", limit * bars_per_bucket, proxy, self.kline_cache_15m
             )
             if not klines1 or not klines2:
                 return []
             pair_15m = build_pair_15m_klines(symbol, klines1, klines2)
             self.kline_cache_15m[symbol] = pair_15m
-            pair_1h = aggregate_pair_15m_to_1h(symbol, pair_15m)
-            return pair_1h[-limit:] if limit > 0 else pair_1h
+            aggregated = (
+                aggregate_pair_15m_to_1h(symbol, pair_15m)
+                if interval == "1h"
+                else aggregate_pair_15m_to_4h(symbol, pair_15m)
+            )
+            return aggregated[-limit:] if limit > 0 else aggregated
 
         klines1 = await self._get_component_klines(sym1, interval, limit, proxy, kline_cache)
         klines2 = await self._get_component_klines(sym2, interval, limit, proxy, kline_cache)
@@ -756,11 +1090,13 @@ class NotificationService:
 
         for symbol in self.single_list:
             await self._recalculate_states(symbol)
+            await self._recalculate_4h_breakout_state(symbol)
         for symbol in self.pair_list:
             if self._use_clustering_for_symbol(symbol):
                 await self._ct_recalculate_states_clustering(symbol)
             else:
                 await self._recalculate_states(symbol)
+                await self._recalculate_4h_breakout_state(symbol)
 
         for symbol in self.single_list:
             self._log_symbol_state(symbol)
@@ -866,10 +1202,7 @@ class NotificationService:
         """Stop service."""
         self.running = False
         self._hl_ws_running = False
-        if hasattr(self, "_hl_ws") and self._hl_ws:
-            await self._hl_ws.close()
-        if hasattr(self, "_hl_session") and self._hl_session:
-            await self._hl_session.close()
+        await self._close_hyperliquid_ws()
         if self.observer:
             self.observer.stop()
             self.observer.join()
