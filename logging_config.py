@@ -11,6 +11,7 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from logging.handlers import RotatingFileHandler
 
 
 class LogLevel(Enum):
@@ -128,9 +129,14 @@ class ColoredFormatter(logging.Formatter):
 
 _logger_initialized = False
 ERROR_LOG_FILE = "error.log"
+DEBUG_LOG_FILE = "debug.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 
 
-def setup_logging(debug: bool = False) -> None:
+def setup_logging(
+    debug: bool = False, debug_log_path: str = DEBUG_LOG_FILE, error_log_path: str = ERROR_LOG_FILE
+) -> None:
     """
     Setup logging with ISO formatter.
 
@@ -150,13 +156,23 @@ def setup_logging(debug: bool = False) -> None:
     console.setFormatter(ColoredFormatter())
     root.addHandler(console)
 
-    error_handler = logging.FileHandler(ERROR_LOG_FILE, encoding="utf-8")
+    error_handler = RotatingFileHandler(
+        error_log_path,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
     error_handler.setLevel(logging.ERROR)
     error_handler.setFormatter(ISOFormatter())
     root.addHandler(error_handler)
 
     if debug:
-        file_handler = logging.FileHandler("debug.log", encoding="utf-8")
+        file_handler = RotatingFileHandler(
+            debug_log_path,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(CondensedHttpFormatter())
         root.addHandler(file_handler)

@@ -9,10 +9,34 @@ Responsibilities:
 
 from typing import Any
 
-from notifications import format_number
+from notifications import (
+    ALERT_BREAKOUT,
+    BREAKOUT_CONFIRMED,
+    BREAKOUT_FALSE_NO_CONTINUATION,
+    BREAKOUT_FALSE_REVERSE,
+    DIRECTION_LONG,
+    DIRECTION_SHORT,
+    REASON_NO_CONTINUATION,
+    REASON_REVERSE,
+    emit_alert,
+    format_breakout_message,
+    format_number,
+)
 
 MIN_KLINES_FOR_BREAKOUT = 2
 MAX_KLINE_MONITOR_COUNT = 20
+MIN_PAIR_PARTS = 2
+
+
+def _split_pair_symbol(symbol: str) -> tuple[str, str] | None:
+    """Split pair symbols supporting both legacy ':' and runtime '-' separators."""
+    if "-" in symbol:
+        left, right = symbol.split("-", 1)
+        return left, right
+    parts = symbol.split(":")
+    if len(parts) >= MIN_PAIR_PARTS:
+        return parts[0], parts[1]
+    return None
 
 
 async def start_breakout_monitor(  # noqa: PLR0913
@@ -78,17 +102,19 @@ async def start_breakout_monitor(  # noqa: PLR0913
     }
 
     if is_pair_trading:
-        parts = symbol.split(":")
-        breakout_comp_prices[parts[0]] = 0
-        breakout_comp_prices[parts[1]] = 0
+        pair_parts = _split_pair_symbol(symbol)
+        if pair_parts is not None:
+            breakout_comp_prices[pair_parts[0]] = 0
+            breakout_comp_prices[pair_parts[1]] = 0
 
 
-async def check_breakout(  # noqa: PLR0912
+async def check_breakout(  # noqa: PLR0912, PLR0913
     symbol: str,
     breakout_monitor: dict[str, Any],
     send_webhook_fn: Any,
     increment_alert_count_fn: Any,
     stop_breakout_monitor_fn: Any = None,
+    send_event_fn: Any = None,
 ) -> None:
     """
     Detect if breakout is confirmed or failed.
@@ -124,48 +150,54 @@ async def check_breakout(  # noqa: PLR0912
 
     if direction == "11":
         if current_close > max_prev:
-            await send_webhook_fn(
-                "BREAKOUT",
-                f"{symbol} LONG CONFIRMED",
+            await emit_alert(
+                send_webhook_fn,
+                ALERT_BREAKOUT,
+                format_breakout_message(symbol, DIRECTION_LONG, BREAKOUT_CONFIRMED),
                 {
                     "symbol": symbol,
-                    "direction": "LONG",
+                    "direction": DIRECTION_LONG,
                     "confirmed": True,
                     "price": format_number(current_close),
                     "trigger": format_number(trigger_price),
                 },
+                send_event_fn,
             )
             increment_alert_count_fn()
             if stop_breakout_monitor_fn:
                 await stop_breakout_monitor_fn(symbol)
 
         elif current_close < min_prev:
-            await send_webhook_fn(
-                "BREAKOUT",
-                f"{symbol} LONG FALSE (REVERSE)",
+            await emit_alert(
+                send_webhook_fn,
+                ALERT_BREAKOUT,
+                format_breakout_message(symbol, DIRECTION_LONG, BREAKOUT_FALSE_REVERSE),
                 {
                     "symbol": symbol,
-                    "direction": "LONG",
+                    "direction": DIRECTION_LONG,
                     "confirmed": False,
-                    "reason": "reverse",
+                    "reason": REASON_REVERSE,
                     "price": format_number(current_close),
                 },
+                send_event_fn,
             )
             increment_alert_count_fn()
             if stop_breakout_monitor_fn:
                 await stop_breakout_monitor_fn(symbol)
 
         elif count >= MAX_KLINE_MONITOR_COUNT:
-            await send_webhook_fn(
-                "BREAKOUT",
-                f"{symbol} LONG FALSE (NO_CONTINUATION)",
+            await emit_alert(
+                send_webhook_fn,
+                ALERT_BREAKOUT,
+                format_breakout_message(symbol, DIRECTION_LONG, BREAKOUT_FALSE_NO_CONTINUATION),
                 {
                     "symbol": symbol,
-                    "direction": "LONG",
+                    "direction": DIRECTION_LONG,
                     "confirmed": False,
-                    "reason": "no_continuation",
+                    "reason": REASON_NO_CONTINUATION,
                     "price": format_number(current_close),
                 },
+                send_event_fn,
             )
             increment_alert_count_fn()
             if stop_breakout_monitor_fn:
@@ -173,48 +205,54 @@ async def check_breakout(  # noqa: PLR0912
 
     elif direction == "00":
         if current_close < min_prev:
-            await send_webhook_fn(
-                "BREAKOUT",
-                f"{symbol} SHORT CONFIRMED",
+            await emit_alert(
+                send_webhook_fn,
+                ALERT_BREAKOUT,
+                format_breakout_message(symbol, DIRECTION_SHORT, BREAKOUT_CONFIRMED),
                 {
                     "symbol": symbol,
-                    "direction": "SHORT",
+                    "direction": DIRECTION_SHORT,
                     "confirmed": True,
                     "price": format_number(current_close),
                     "trigger": format_number(trigger_price),
                 },
+                send_event_fn,
             )
             increment_alert_count_fn()
             if stop_breakout_monitor_fn:
                 await stop_breakout_monitor_fn(symbol)
 
         elif current_close > max_prev:
-            await send_webhook_fn(
-                "BREAKOUT",
-                f"{symbol} SHORT FALSE (REVERSE)",
+            await emit_alert(
+                send_webhook_fn,
+                ALERT_BREAKOUT,
+                format_breakout_message(symbol, DIRECTION_SHORT, BREAKOUT_FALSE_REVERSE),
                 {
                     "symbol": symbol,
-                    "direction": "SHORT",
+                    "direction": DIRECTION_SHORT,
                     "confirmed": False,
-                    "reason": "reverse",
+                    "reason": REASON_REVERSE,
                     "price": format_number(current_close),
                 },
+                send_event_fn,
             )
             increment_alert_count_fn()
             if stop_breakout_monitor_fn:
                 await stop_breakout_monitor_fn(symbol)
 
         elif count >= MAX_KLINE_MONITOR_COUNT:
-            await send_webhook_fn(
-                "BREAKOUT",
-                f"{symbol} SHORT FALSE (NO_CONTINUATION)",
+            await emit_alert(
+                send_webhook_fn,
+                ALERT_BREAKOUT,
+                format_breakout_message(symbol, DIRECTION_SHORT, BREAKOUT_FALSE_NO_CONTINUATION),
                 {
                     "symbol": symbol,
-                    "direction": "SHORT",
+                    "direction": DIRECTION_SHORT,
                     "confirmed": False,
-                    "reason": "no_continuation",
+                    "reason": REASON_NO_CONTINUATION,
                     "price": format_number(current_close),
                 },
+                send_event_fn,
             )
             increment_alert_count_fn()
             if stop_breakout_monitor_fn:

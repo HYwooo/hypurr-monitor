@@ -12,6 +12,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from .alert_event import AlertEvent, build_alert_event
+from .webhook_sender import WebhookSender
+
 WEBHOOK_LOG_FILE = "webhook.log"
 WEBHOOK_SUCCESS_STATUS_CODE = 200
 
@@ -31,7 +34,7 @@ def log_error(msg: str) -> None:
     _get_logger().error(msg)
 
 
-def _rotate_webhook_log_if_needed(max_log_lines: int = 1000) -> None:
+def _rotate_webhook_log_if_needed(log_file_path: str = WEBHOOK_LOG_FILE, max_log_lines: int = 1000) -> None:
     """
     If webhook.log exceeds max_log_lines, truncate to latest max_log_lines.
 
@@ -39,7 +42,7 @@ def _rotate_webhook_log_if_needed(max_log_lines: int = 1000) -> None:
         max_log_lines: Maximum lines to retain (default 1000)
     """
     try:
-        log_path = Path(WEBHOOK_LOG_FILE)
+        log_path = Path(log_file_path)
         if not log_path.exists():
             return
         lines = log_path.read_text(encoding="utf-8").splitlines()
@@ -265,8 +268,10 @@ async def send_webhook(  # noqa: PLR0913
     alert_type: str,
     message: str,
     extra: dict[str, Any] | None = None,
+    log_file_path: str = WEBHOOK_LOG_FILE,
     max_log_lines: int = 1000,
     get_timestamp_fn: Any = None,
+    sender: WebhookSender | None = None,
 ) -> None:
     """
     Send Feishu Webhook message.
@@ -286,51 +291,74 @@ async def send_webhook(  # noqa: PLR0913
         max_log_lines: Log rotation threshold
         get_timestamp_fn: Timestamp getter function (optional, default returns empty)
     """
+    event = build_alert_event(alert_type, message, extra)
+    await send_alert_event(
+        webhook_url,
+        webhook_format,
+        event,
+        log_file_path=log_file_path,
+        max_log_lines=max_log_lines,
+        get_timestamp_fn=get_timestamp_fn,
+        sender=sender,
+    )
+
+
+def _build_log_message(event: AlertEvent) -> str:
+    """Build operator-facing log line from structured alert event."""
+    price = event.extra.get("price", "")
+    atr_upper = event.extra.get("atr_upper", "")
+    atr_lower = event.extra.get("atr_lower", "")
+    stop_line = event.extra.get("stop_line", "")
+    entry_price = event.extra.get("entry_price", "")
+    reason = event.extra.get("reason", "")
+
+    if event.alert_type == "SYSTEM":
+        return f"[WEBHOOK] {event.message}"
+    if reason == "trailing_stop":
+        return f"[WEBHOOK] {event.message} | Price={price} | Stop={stop_line} | Entry={entry_price}"
+    if event.alert_type == "ATR_Ch":
+        return f"[WEBHOOK] {event.message} | Price={price} | Channel={atr_lower}~{atr_upper}"
+    return f"[WEBHOOK] {event.message}"
+
+
+async def send_alert_event(  # noqa: PLR0913
+    webhook_url: str,
+    webhook_format: str,
+    event: AlertEvent,
+    log_file_path: str = WEBHOOK_LOG_FILE,
+    max_log_lines: int = 1000,
+    get_timestamp_fn: Any = None,
+    sender: WebhookSender | None = None,
+) -> None:
+    """Send a structured AlertEvent through the legacy Feishu webhook path."""
     timestamp = get_timestamp_fn() if get_timestamp_fn else ""
-    full_content = f"[{timestamp}] [{alert_type}] {message}"
+    full_content = f"[{timestamp}] [{event.alert_type}] {event.message}"
 
-    extra = extra or {}
-    price = extra.get("price", "")
-    atr_upper = extra.get("atr_upper", "")
-    atr_lower = extra.get("atr_lower", "")
-    stop_line = extra.get("stop_line", "")
-    entry_price = extra.get("entry_price", "")
-    reason = extra.get("reason", "")
-
-    if alert_type == "SYSTEM":
-        log_msg = f"[WEBHOOK] {message}"
-    elif reason == "trailing_stop":
-        log_msg = f"[WEBHOOK] {message} | Price={price} | Stop={stop_line} | Entry={entry_price}"
-    elif alert_type == "ATR_Ch":
-        log_msg = f"[WEBHOOK] {message} | Price={price} | Channel={atr_lower}~{atr_upper}"
-    else:
-        log_msg = f"[WEBHOOK] {message}"
-
-    # Step 1: Write to log file
     try:
-        _rotate_webhook_log_if_needed(max_log_lines)
-        with Path(WEBHOOK_LOG_FILE).open("a", encoding="utf-8") as f:
+        _rotate_webhook_log_if_needed(log_file_path, max_log_lines)
+        with Path(log_file_path).open("a", encoding="utf-8") as f:
             f.write(f"{full_content}\n")
     except Exception as e:
         _get_logger().warning(f"Write webhook log failed: {e}")
 
-    # Step 2: Always log to console BEFORE sending (even if request fails)
-    _get_logger().info(log_msg)
+    _get_logger().info(_build_log_message(event))
 
-    # Step 3: Build message
     if webhook_format == "card":
-        card = build_feishu_card(alert_type, message, extra or {}, timestamp)
+        card = build_feishu_card(event.alert_type, event.message, event.extra, timestamp)
         msg = {"msg_type": "interactive", "card": card}
     else:
         msg = {"msg_type": "text", "content": {"text": full_content}}
 
-    # Step 4: Send HTTP request
+    if sender is not None:
+        await sender.send_json(webhook_url, msg)
+        return
+
     import aiohttp
 
     try:
         async with (
-            aiohttp.ClientSession() as session,
-            session.post(webhook_url, json=msg, timeout=aiohttp.ClientTimeout(total=10)) as resp,
+            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10.0)) as session,
+            session.post(webhook_url, json=msg, timeout=aiohttp.ClientTimeout(total=10.0)) as resp,
         ):
             if resp.status != WEBHOOK_SUCCESS_STATUS_CODE:
                 log_error(f"Webhook failed: {resp.status}")

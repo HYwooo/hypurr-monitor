@@ -1,6 +1,8 @@
 """Tests for signal detection module - price comparisons and state machines."""
 
+import asyncio
 import time
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,6 +11,7 @@ import orjson
 import pytest
 
 from models import Kline
+from notifications import build_alert_event
 from service.notification_service import (
     NotificationService,
     aggregate_pair_15m_to_1h,
@@ -486,6 +489,77 @@ class TestNotificationServiceATRMode:
         service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
         assert service._use_clustering_for_symbol("AAA-BBB") is False
 
+    def test_runtime_paths_resolve_relative_to_config_dir(self, tmp_path: Any) -> None:
+        """Heartbeat and webhook runtime files should resolve from config directory."""
+        config_dir = tmp_path / "runtime"
+        config_dir.mkdir()
+        config_path = self._write_config(config_dir, clustering_enabled=False)
+
+        service = NotificationService(config_path)
+
+        assert Path(service.heartbeat_file) == config_dir / "heartbeat"
+        assert Path(service.webhook_log_file) == config_dir / "webhook.log"
+
+    def test_cleanup_symbol_state_removes_symbol_scoped_runtime_data(self, tmp_path: Any) -> None:
+        """Cleanup should remove symbol-scoped runtime entries and alert keys."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        symbol = "AAA-BBB"
+        service.mark_prices[symbol] = 1.2
+        service.mark_price_times[symbol] = 2.0
+        service.kline_cache[symbol] = []
+        service.kline_cache_4h[symbol] = []
+        service.kline_cache_15m[symbol] = []
+        service.benchmark[symbol] = {"atr1h_upper": 1.3}
+        service.last_st_state[symbol] = "long"
+        service.last_atr_state[symbol] = {"ch": 1}
+        service.last_atr4h_state[symbol] = {"ch": 1}
+        service.last_kline_time[symbol] = 123
+        service.breakout_monitor[symbol] = {"state": "watching"}
+        service.trailing_stop[symbol] = {"active": True}
+        service.last_atr1h_ch[symbol] = 1
+        service.clustering_states[symbol] = {"trend": 1}
+        service.last_clustering_state[symbol] = {"trend": 1}
+        service._last_atr_refresh_attempt[symbol] = 1.0
+        service._last_atr4h_refresh_attempt[symbol] = 1.0
+        service._last_trailing_refresh_attempt[symbol] = 1.0
+        service.last_alert_time[f"ATR_Ch_{symbol}"] = 1.0
+        service.last_alert_time[f"ATR_4H_{symbol}"] = 1.0
+        service.last_alert_time[f"ClusterST_{symbol}"] = 1.0
+        service.last_alert_time[symbol] = 1.0
+
+        service._cleanup_symbol_state(symbol)
+
+        assert symbol not in service.mark_prices
+        assert symbol not in service.benchmark
+        assert f"ATR_Ch_{symbol}" not in service.last_alert_time
+        assert f"ATR_4H_{symbol}" not in service.last_alert_time
+        assert f"ClusterST_{symbol}" not in service.last_alert_time
+        assert symbol not in service.trailing_stop
+
+    def test_prune_runtime_state_keeps_active_pair_components(self, tmp_path: Any) -> None:
+        """Prune should keep active pair legs while removing stale symbols."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        service.mark_prices["AAA"] = 2.0
+        service.mark_prices["BBB"] = 1.0
+        service.mark_prices["STALE"] = 9.9
+        service.kline_cache["AAA"] = []
+        service.kline_cache["BBB"] = []
+        service.kline_cache["STALE"] = []
+        service.benchmark["AAA-BBB"] = {"ok": True}
+        service.benchmark["STALE"] = {"old": True}
+        service.last_alert_time["ATR_Ch_AAA-BBB"] = 1.0
+        service.last_alert_time["ATR_Ch_STALE"] = 1.0
+
+        service._prune_runtime_state()
+
+        assert "AAA" in service.mark_prices
+        assert "BBB" in service.mark_prices
+        assert "STALE" not in service.mark_prices
+        assert "STALE" not in service.kline_cache
+        assert "STALE" not in service.benchmark
+        assert "ATR_Ch_AAA-BBB" in service.last_alert_time
+        assert "ATR_Ch_STALE" not in service.last_alert_time
+
     @pytest.mark.asyncio
     async def test_refresh_trailing_stop_channel_uses_full_15m_history(self, tmp_path: Any) -> None:
         """Trailing stop refresh should rebuild ATR channel from fetched 15m history."""
@@ -728,6 +802,209 @@ class TestNotificationServiceATRMode:
         assert int(heartbeat_path.read_text(encoding="utf-8").strip()) > 0
         assert service._last_ws_data_time > 0
 
+    @pytest.mark.asyncio
+    async def test_stop_cancels_ws_tasks_and_clears_list(self, tmp_path: Any) -> None:
+        """Stopping the service should cancel outstanding websocket tasks."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+
+        async def pending_task() -> None:
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(pending_task())
+        service._ws_tasks = [task]
+        service._close_hyperliquid_ws = AsyncMock()
+
+        await service.stop()
+
+        assert task.cancelled() is True
+        assert service._ws_tasks == []
+
+    @pytest.mark.asyncio
+    async def test_stop_closes_shared_webhook_sender(self, tmp_path: Any) -> None:
+        """Stopping the service should close the shared webhook sender session."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        service._close_hyperliquid_ws = AsyncMock()
+        service._webhook_sender.close = AsyncMock()
+
+        await service.stop()
+
+        service._webhook_sender.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_connect_hyperliquid_ws_uses_gateway_open_stream(self, tmp_path: Any) -> None:
+        """WS connect connector should delegate stream open to MarketGateway."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        fake_session = MagicMock(spec=aiohttp.ClientSession)
+        fake_ws = MagicMock(spec=aiohttp.ClientWebSocketResponse)
+        service.market_gateway.open_mark_price_stream = AsyncMock(return_value=(fake_session, fake_ws))  # type: ignore[method-assign]
+
+        await service._connect_hyperliquid_ws(start_watch_task=False)
+
+        service.market_gateway.open_mark_price_stream.assert_awaited_once_with("wss://api.hyperliquid.xyz/ws")
+        assert service._hl_session is fake_session
+        assert service._hl_ws is fake_ws
+
+    @pytest.mark.asyncio
+    async def test_close_hyperliquid_ws_uses_gateway_close_helper(self, tmp_path: Any) -> None:
+        """WS close connector should delegate socket resource cleanup to MarketGateway."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        fake_session = MagicMock(spec=aiohttp.ClientSession)
+        fake_ws = MagicMock(spec=aiohttp.ClientWebSocketResponse)
+        service._hl_session = fake_session
+        service._hl_ws = fake_ws
+        service.market_gateway.close_ws_resources = AsyncMock()  # type: ignore[method-assign]
+
+        await service._close_hyperliquid_ws()
+
+        service.market_gateway.close_ws_resources.assert_awaited_once_with(fake_session, fake_ws)
+        assert service._hl_session is None
+        assert service._hl_ws is None
+
+    @pytest.mark.asyncio
+    async def test_send_event_uses_structured_alert_path(self, tmp_path: Any) -> None:
+        """Structured events should be sendable through the public service facade."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        service._webhook_sender.send_json = AsyncMock()
+        event = build_alert_event("SYSTEM", "structured-service")
+
+        await service.send_event(event)
+
+        service._webhook_sender.send_json.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ct_check_breakout_routes_to_structured_events(self, tmp_path: Any) -> None:
+        """Breakout connector should pass service.send_event into breakout checks."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        symbol = "AAA-BBB"
+        service.breakout_monitor[symbol] = {
+            "direction": "11",
+            "trigger_price": 1.0,
+            "kline_15m_count": 1,
+            "klines_15m": [
+                Kline(symbol=symbol, interval="15m", open_time=1, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0),
+                Kline(symbol=symbol, interval="15m", open_time=2, open=1.1, high=1.2, low=1.1, close=1.2, volume=1.0),
+            ],
+        }
+        service.send_event = AsyncMock()
+
+        await service._ct_check_breakout(symbol)
+
+        service.send_event.assert_awaited_once()
+        await_args = service.send_event.await_args
+        assert await_args is not None
+        event = await_args.args[0]
+        assert event.alert_type == "BREAKOUT"
+        assert event.symbol == symbol
+
+    @pytest.mark.asyncio
+    async def test_ct_check_signals_starts_breakout_monitor_on_new_atr_signal(self, tmp_path: Any) -> None:
+        """Fresh ATR breakout should start breakout monitor after trailing is created."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        symbol = "BTC"
+        service._initialized = True
+        service.mark_prices[symbol] = 52000.0
+        service.mark_price_times[symbol] = time.time()
+        service.benchmark[symbol] = {
+            "st1": 49000.0,
+            "st2": 48000.0,
+            "atr1h_upper": 51000.0,
+            "atr1h_lower": 49000.0,
+        }
+        service._send_webhook = AsyncMock()
+        service.send_event = AsyncMock()
+        service._refresh_trailing_stop_channel = AsyncMock()
+        service._signal_coordinator.start_breakout_monitor_fn = AsyncMock()
+
+        await service._ct_check_signals(symbol)
+
+        service._signal_coordinator.start_breakout_monitor_fn.assert_awaited_once()
+        await_args = service._signal_coordinator.start_breakout_monitor_fn.await_args
+        assert await_args is not None
+        assert await_args.args[0] == symbol
+        assert await_args.args[1] == "11"
+        assert await_args.args[2] == 52000.0
+        assert isinstance(await_args.args[3], float)
+
+    @pytest.mark.asyncio
+    async def test_ct_check_breakout_waits_for_new_15m_bar(self, tmp_path: Any) -> None:
+        """Breakout monitor should not evaluate until a new 15m bar advances the monitor."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        symbol = "AAA-BBB"
+        service.breakout_monitor[symbol] = {
+            "direction": "11",
+            "trigger_price": 1.0,
+            "kline_15m_count": 0,
+            "klines_15m": [
+                Kline(symbol=symbol, interval="15m", open_time=1, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0),
+                Kline(symbol=symbol, interval="15m", open_time=2, open=1.1, high=1.1, low=1.0, close=1.1, volume=1.0),
+            ],
+        }
+        service.kline_cache_15m[symbol] = service.breakout_monitor[symbol]["klines_15m"]
+        service.send_event = AsyncMock()
+
+        await service._ct_check_breakout(symbol)
+
+        service.send_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ct_check_breakout_syncs_from_cached_15m_bars(self, tmp_path: Any) -> None:
+        """Breakout connector should advance monitor state from refreshed 15m cache."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+        symbol = "AAA-BBB"
+        service.breakout_monitor[symbol] = {
+            "direction": "11",
+            "trigger_price": 1.0,
+            "kline_15m_count": 0,
+            "klines_15m": [
+                Kline(symbol=symbol, interval="15m", open_time=1, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0),
+                Kline(
+                    symbol=symbol, interval="15m", open_time=2, open=1.05, high=1.05, low=1.0, close=1.05, volume=1.0
+                ),
+            ],
+        }
+        service.kline_cache_15m[symbol] = [
+            Kline(symbol=symbol, interval="15m", open_time=1, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0),
+            Kline(symbol=symbol, interval="15m", open_time=2, open=1.05, high=1.05, low=1.0, close=1.05, volume=1.0),
+            Kline(symbol=symbol, interval="15m", open_time=3, open=1.1, high=1.2, low=1.1, close=1.2, volume=1.0),
+        ]
+        service.send_event = AsyncMock()
+        service._signal_coordinator.stop_breakout_monitor_fn = AsyncMock()
+
+        await service._ct_check_breakout(symbol)
+
+        service.send_event.assert_awaited_once()
+        assert service.breakout_monitor[symbol]["kline_15m_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_ct_start_breakout_monitor_uses_service_dependencies(self, tmp_path: Any) -> None:
+        """Breakout start connector should use the service fetchers and runtime state."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+
+        async def fake_pair_fetch(
+            symbol: str,
+            limit: int = 500,
+            interval: str = "1h",
+            proxy: str | None = None,
+            kline_cache: dict[str, Any] | None = None,
+            _fetch_klines_fn: Any = None,
+        ) -> list[Kline]:
+            _ = (limit, proxy, kline_cache, _fetch_klines_fn)
+            assert symbol == "AAA-BBB"
+            assert interval == "15m"
+            now = int(time.time() * 1000)
+            return [
+                Kline(
+                    symbol=symbol, interval="15m", open_time=now + i, open=1.0, high=1.1, low=0.9, close=1.0, volume=1.0
+                )
+                for i in range(20)
+            ]
+
+        service._hl_fetch_pair_klines = fake_pair_fetch  # type: ignore[method-assign]
+
+        await service._ct_start_breakout_monitor("AAA-BBB", "11", 1.0, 123.0)
+
+        assert "AAA-BBB" in service.breakout_monitor
+
 
 class TestCheckTrailingStop:
     """Test trailing stop logic."""
@@ -765,6 +1042,33 @@ class TestCheckTrailingStop:
         mock_webhook.assert_called_once()
         args, kwargs = mock_webhook.call_args
         assert "TRAILING STOP" in args[1]
+
+    @pytest.mark.asyncio
+    async def test_long_stop_can_emit_structured_event(
+        self, mock_webhook: AsyncMock, mock_increment: MagicMock
+    ) -> None:
+        """Structured alert callback should be preferred when provided."""
+        trailing_stop: dict[str, Any] = {
+            "BTC": {
+                "direction": "LONG",
+                "entry_price": 50000.0,
+                "atr15m_upper": 52000.0,
+                "atr15m_lower": 49000.0,
+                "active": True,
+            }
+        }
+        send_event = AsyncMock()
+
+        await check_trailing_stop("BTC", 48500.0, trailing_stop, mock_webhook, mock_increment, None, send_event)
+
+        mock_webhook.assert_not_called()
+        send_event.assert_awaited_once()
+        await_args = send_event.await_args
+        assert await_args is not None
+        event = await_args.args[0]
+        assert event.alert_type == "ATR_Ch"
+        assert event.event == "trailing_stop"
+        assert event.symbol == "BTC"
 
     @pytest.mark.asyncio
     async def test_short_stop_triggered(self, mock_webhook: AsyncMock, mock_increment: MagicMock) -> None:

@@ -6,6 +6,7 @@ Architecture:
 - WebSocket (Native): Mark prices batch subscription (~690 prices)
 """
 
+from .market_gateway import MarketGateway
 from .rest_client import HyperliquidREST
 from .symbol import (
     HyperliquidSymbol,
@@ -19,6 +20,7 @@ __all__ = [
     "HyperliquidREST",
     "HyperliquidSymbol",
     "HyperliquidWS",
+    "MarketGateway",
     "get_fetch_params",
     "get_mark_prices_once",
     "get_ws_symbol",

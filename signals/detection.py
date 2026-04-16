@@ -25,7 +25,17 @@ from indicators import (
     clustering_supertrend,
     run_atr_channel,
 )
-from notifications import format_number
+from notifications import (
+    ALERT_ATR_CHANNEL,
+    ALERT_CLUSTER_ST,
+    DIRECTION_LONG,
+    DIRECTION_SHORT,
+    REASON_TRAILING_STOP,
+    emit_alert,
+    format_directional_signal_message,
+    format_number,
+    format_trailing_stop_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +360,7 @@ async def check_signals(  # noqa: PLR0913
     _atr15m_mult: float,
     send_webhook_fn: Any,
     increment_alert_count_fn: Any,
+    send_event_fn: Any = None,
 ) -> None:
     """
     ATR Channel signal detection entry function (wrapper).
@@ -376,6 +387,7 @@ async def check_signals(  # noqa: PLR0913
             _atr15m_mult,
             send_webhook_fn,
             increment_alert_count_fn,
+            send_event_fn,
         )
 
 
@@ -397,6 +409,7 @@ async def check_signals_impl(  # noqa: PLR0913
     atr15m_mult: float,
     send_webhook_fn: Any,
     increment_alert_count_fn: Any,
+    send_event_fn: Any = None,
 ) -> None:
     """
     ATR Channel signal detection implementation.
@@ -438,21 +451,23 @@ async def check_signals_impl(  # noqa: PLR0913
             last_alert_time[f"ATR_Ch_{symbol}"] = now
             last_atr_state[symbol] = {"ch": 1, "sent": "LONG"}
             natr = (atr1h_natrr / current_price * 100) if current_price > 0 and atr1h_natrr > 0 else None
-            await send_webhook_fn(
-                "ATR_Ch",
-                f"[{symbol}] LONG",
+            await emit_alert(
+                send_webhook_fn,
+                ALERT_ATR_CHANNEL,
+                format_directional_signal_message(symbol, DIRECTION_LONG),
                 {
                     "symbol": symbol,
-                    "direction": "LONG",
+                    "direction": DIRECTION_LONG,
                     "price": format_number(current_price),
                     "atr_upper": format_number(atr1h_upper),
                     "atr_lower": format_number(atr1h_lower),
                     "natr": natr,
                 },
+                send_event_fn,
             )
             increment_alert_count_fn()
             trailing_stop[symbol] = {
-                "direction": "LONG",
+                "direction": DIRECTION_LONG,
                 "entry_price": current_price,
                 "entry_time": now,
                 "atr_mult": atr15m_mult,
@@ -468,21 +483,23 @@ async def check_signals_impl(  # noqa: PLR0913
             last_alert_time[f"ATR_Ch_{symbol}"] = now
             last_atr_state[symbol] = {"ch": -1, "sent": "SHORT"}
             natr = (atr1h_natrr / current_price * 100) if current_price > 0 and atr1h_natrr > 0 else None
-            await send_webhook_fn(
-                "ATR_Ch",
-                f"[{symbol}] SHORT",
+            await emit_alert(
+                send_webhook_fn,
+                ALERT_ATR_CHANNEL,
+                format_directional_signal_message(symbol, DIRECTION_SHORT),
                 {
                     "symbol": symbol,
-                    "direction": "SHORT",
+                    "direction": DIRECTION_SHORT,
                     "price": format_number(current_price),
                     "atr_upper": format_number(atr1h_upper),
                     "atr_lower": format_number(atr1h_lower),
                     "natr": natr,
                 },
+                send_event_fn,
             )
             increment_alert_count_fn()
             trailing_stop[symbol] = {
-                "direction": "SHORT",
+                "direction": DIRECTION_SHORT,
                 "entry_price": current_price,
                 "entry_time": now,
                 "atr_mult": atr15m_mult,
@@ -500,6 +517,7 @@ async def check_trailing_stop(  # noqa: PLR0913, PLR0912
     send_webhook_fn: Any,
     increment_alert_count_fn: Any,
     last_alert_time: dict[str, Any] | None = None,
+    send_event_fn: Any = None,
 ) -> None:
     """
     Check if trailing stop is triggered.
@@ -532,39 +550,43 @@ async def check_trailing_stop(  # noqa: PLR0913, PLR0912
         if ts_entry.get("use_clustering_ts"):  # type: ignore[union-attr]
             clustering_ts_val = ts_entry.get("clustering_ts", 0)  # type: ignore[union-attr]
             if clustering_ts_val > 0:
-                if direction == "LONG" and price_lt(current_price, clustering_ts_val):
-                    await send_webhook_fn(
-                        "ATR_Ch",
-                        f"[{symbol}] TRAILING STOP",
+                if direction == DIRECTION_LONG and price_lt(current_price, clustering_ts_val):
+                    await emit_alert(
+                        send_webhook_fn,
+                        ALERT_ATR_CHANNEL,
+                        format_trailing_stop_message(symbol),
                         {
                             "symbol": symbol,
-                            "direction": "LONG",
+                            "direction": DIRECTION_LONG,
                             "price": format_number(current_price),
                             "stop_line": format_number(clustering_ts_val),
                             "entry_price": format_number(
                                 ts_entry.get("entry_price", 0)  # type: ignore[union-attr]
                             ),
-                            "reason": "trailing_stop",
+                            "reason": REASON_TRAILING_STOP,
                         },
+                        send_event_fn,
                     )
                     increment_alert_count_fn()
                     ts_entry["active"] = False  # type: ignore[index]
                     if last_alert_time is not None:
                         last_alert_time[symbol] = 0
-                elif direction == "SHORT" and price_gt(current_price, clustering_ts_val):
-                    await send_webhook_fn(
-                        "ATR_Ch",
-                        f"[{symbol}] TRAILING STOP",
+                elif direction == DIRECTION_SHORT and price_gt(current_price, clustering_ts_val):
+                    await emit_alert(
+                        send_webhook_fn,
+                        ALERT_ATR_CHANNEL,
+                        format_trailing_stop_message(symbol),
                         {
                             "symbol": symbol,
-                            "direction": "SHORT",
+                            "direction": DIRECTION_SHORT,
                             "price": format_number(current_price),
                             "stop_line": format_number(clustering_ts_val),
                             "entry_price": format_number(
                                 ts_entry.get("entry_price", 0)  # type: ignore[union-attr]
                             ),
-                            "reason": "trailing_stop",
+                            "reason": REASON_TRAILING_STOP,
                         },
+                        send_event_fn,
                     )
                     increment_alert_count_fn()
                     ts_entry["active"] = False  # type: ignore[index]
@@ -575,36 +597,40 @@ async def check_trailing_stop(  # noqa: PLR0913, PLR0912
         upper = ts_entry.get("atr15m_upper", 0)  # type: ignore[union-attr]
         lower = ts_entry.get("atr15m_lower", 0)  # type: ignore[union-attr]
 
-        if direction == "LONG" and lower > 0 and price_lt(current_price, lower):
-            await send_webhook_fn(
-                "ATR_Ch",
-                f"[{symbol}] TRAILING STOP",
+        if direction == DIRECTION_LONG and lower > 0 and price_lt(current_price, lower):
+            await emit_alert(
+                send_webhook_fn,
+                ALERT_ATR_CHANNEL,
+                format_trailing_stop_message(symbol),
                 {
                     "symbol": symbol,
-                    "direction": "LONG",
+                    "direction": DIRECTION_LONG,
                     "price": format_number(current_price),
                     "stop_line": format_number(lower),
                     "entry_price": format_number(ts_entry.get("entry_price", 0)),  # type: ignore[union-attr]
-                    "reason": "trailing_stop",
+                    "reason": REASON_TRAILING_STOP,
                 },
+                send_event_fn,
             )
             increment_alert_count_fn()
             ts_entry["active"] = False  # type: ignore[index]
             if last_alert_time is not None:
                 last_alert_time[symbol] = 0
 
-        elif direction == "SHORT" and upper > 0 and price_gt(current_price, upper):
-            await send_webhook_fn(
-                "ATR_Ch",
-                f"[{symbol}] TRAILING STOP",
+        elif direction == DIRECTION_SHORT and upper > 0 and price_gt(current_price, upper):
+            await emit_alert(
+                send_webhook_fn,
+                ALERT_ATR_CHANNEL,
+                format_trailing_stop_message(symbol),
                 {
                     "symbol": symbol,
-                    "direction": "SHORT",
+                    "direction": DIRECTION_SHORT,
                     "price": format_number(current_price),
                     "stop_line": format_number(upper),
                     "entry_price": format_number(ts_entry.get("entry_price", 0)),  # type: ignore[union-attr]
-                    "reason": "trailing_stop",
+                    "reason": REASON_TRAILING_STOP,
                 },
+                send_event_fn,
             )
             increment_alert_count_fn()
             ts_entry["active"] = False  # type: ignore[index]
@@ -766,6 +792,7 @@ async def check_signals_clustering(  # noqa: PLR0913
     _clustering_max_iter: int,
     send_webhook_fn: Any,
     increment_alert_count_fn: Any,
+    send_event_fn: Any = None,
 ) -> None:
     """
     Clustering SuperTrend signal detection entry function (wrapper).
@@ -799,6 +826,7 @@ async def check_signals_clustering(  # noqa: PLR0913
             _clustering_max_iter,
             send_webhook_fn,
             increment_alert_count_fn,
+            send_event_fn,
         )
 
 
@@ -827,6 +855,7 @@ async def check_signals_clustering_impl(  # noqa: PLR0913
     _clustering_max_iter: int,
     send_webhook_fn: Any,
     increment_alert_count_fn: Any,
+    send_event_fn: Any = None,
 ) -> None:
     """
     Clustering SuperTrend signal detection implementation (for PairTrading).
@@ -869,11 +898,12 @@ async def check_signals_clustering_impl(  # noqa: PLR0913
         last_alert = last_alert_time.get(f"ClusterST_{symbol}", 0)
         if now - last_alert > SIGNAL_COOLDOWN:
             last_alert_time[f"ClusterST_{symbol}"] = now
-            direction = "LONG" if current_trend == 1 else "SHORT"
+            direction = DIRECTION_LONG if current_trend == 1 else DIRECTION_SHORT
             last_clustering_state[symbol] = {"trend": current_trend, "sent": direction}
-            await send_webhook_fn(
-                "ClusterST",
-                f"[{symbol}] {direction}",
+            await emit_alert(
+                send_webhook_fn,
+                ALERT_CLUSTER_ST,
+                format_directional_signal_message(symbol, direction),
                 {
                     "symbol": symbol,
                     "direction": direction,
@@ -882,6 +912,7 @@ async def check_signals_clustering_impl(  # noqa: PLR0913
                     "perf_ama": format_number(perf_ama),
                     "target_factor": format_number(target_factor),
                 },
+                send_event_fn,
             )
             increment_alert_count_fn()
             trailing_stop[symbol] = {

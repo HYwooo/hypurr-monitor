@@ -5,19 +5,20 @@ Main notification service - coordinates all modules, manages WebSocket and signa
 import asyncio
 import threading
 import time
+import tomllib
+from collections.abc import MutableMapping
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import aiohttp
 import numpy as np
-import orjson
-import toml  # type: ignore[import-untyped]
 
+from config import load_network_config, resolve_path_from_config
+from hyperliquid import MarketGateway
 from hyperliquid.rest_client import (
     HyperliquidREST,
-    fetch_meta,
     get_cached_klines,
     get_price_decimals,
     update_cache,
@@ -28,14 +29,31 @@ from indicators import (
 )
 from logging_config import get_logger
 from models import Kline
-from notifications import log_warning
-from notifications.webhook import send_webhook
+from notifications import (
+    ALERT_ATR_CHANNEL,
+    ALERT_ERROR,
+    ALERT_SYSTEM,
+    DIRECTION_LONG,
+    DIRECTION_SHORT,
+    AlertEvent,
+    WebhookSender,
+    format_connection_failed_message,
+    format_connection_success_message,
+    format_directional_signal_message,
+    format_ws_data_resumed_message,
+    format_ws_data_silence_message,
+    format_ws_reconnect_failure_message,
+    format_ws_reconnect_success_message,
+    log_warning,
+)
+from service.alert_dispatcher import AlertDispatcher
+from service.market_data_processor import MarketDataProcessor
+from service.signal_coordinator import SignalCoordinator
+from service.ws_runtime_supervisor import WSRuntimeSupervisor
 from signals import (
-    check_signals,
-    check_signals_clustering,
-    check_trailing_stop,
     recalculate_states,
     recalculate_states_clustering,
+    start_breakout_monitor,
     update_klines,
 )
 
@@ -48,13 +66,11 @@ ATR_REFRESH_THROTTLE_SECONDS = 60
 ATR_4H_REFRESH_THROTTLE_SECONDS = 300
 TRAILING_REFRESH_THROTTLE_SECONDS = 30
 MIN_TRAILING_KLINES = 2
-WS_RECEIVE_IDLE_TIMEOUT_SECONDS = 25
-WS_RECONNECT_BASE_DELAY_SECONDS = 2
-WS_RECONNECT_MAX_DELAY_SECONDS = 30
-WS_CONNECT_RECEIVE_TIMEOUT_SECONDS = 65
 PRICE_STALE_THRESHOLD_SECONDS = 300
 ATR_BREAKOUT_COOLDOWN_SECONDS = 3600
 HEARTBEAT_WRITE_THROTTLE_SECONDS = 5
+BREAKOUT_DIRECTION_LONG = "11"
+BREAKOUT_DIRECTION_SHORT = "00"
 
 
 def build_pair_15m_klines(symbol: str, klines1: list[Kline], klines2: list[Kline]) -> list[Kline]:
@@ -154,6 +170,8 @@ class NotificationService:
         self.config_path = config_path
         self.debug = debug
         self.config = self._load_config(config_path)
+        self.network = load_network_config(self.config)
+        self.market_gateway = MarketGateway(self.network.rest, self.network.ws)
         sym_config = self.config.get("symbols", {})
         self.single_list: list[str] = sym_config.get("single_list", [])
         self.pair_list: list[str] = sym_config.get("pair_list", [])
@@ -194,10 +212,11 @@ class NotificationService:
         self.clustering_max_iter = cs_config.get("max_iter", 1000)
         self.clustering_history_klines = cs_config.get("history_klines", 500)
 
-        self.heartbeat_file = self.config["service"]["heartbeat_file"]
+        self.heartbeat_file = resolve_path_from_config(config_path, str(self.config["service"]["heartbeat_file"]))
+        self.webhook_log_file = resolve_path_from_config(config_path, WEBHOOK_LOG_FILE)
         self.heartbeat_timeout = int(self.config.get("service", {}).get("heartbeat_timeout", 120))
-        self.proxy_enable = self.config.get("proxy", {}).get("enable", False)
-        self.proxy_url = self.config.get("proxy", {}).get("url", "")
+        self.proxy_enable = self.network.rest.proxy_url is not None
+        self.proxy_url = self.network.rest.proxy_url or ""
         self.report_enable = self.config.get("report", {}).get("enable", False)
         self.report_times = self.config.get("report", {}).get("times", ["08:00", "20:00"])
         self.timezone = self.config.get("settings", {}).get("timezone", "Z")
@@ -241,6 +260,15 @@ class NotificationService:
         self._last_trailing_refresh_attempt: dict[str, float] = {}
         self._hl_ws: aiohttp.ClientWebSocketResponse | None = None
         self._hl_session: aiohttp.ClientSession | None = None
+        self._webhook_sender = WebhookSender(self.network.webhook)
+        self._alert_dispatcher = AlertDispatcher(
+            self.webhook_url,
+            self.webhook_format,
+            self.webhook_log_file,
+            self.max_log_lines,
+            self._get_timestamp,
+            self._webhook_sender,
+        )
         self._hl_ws_running = False
         self._ws_reconnect_alert_active = False
         self._ws_silence_alert_active = False
@@ -248,6 +276,77 @@ class NotificationService:
         self._last_ws_message_time = 0.0
         self._last_ws_data_time = 0.0
         self._last_heartbeat_write_time = 0.0
+        self._market_data_processor = MarketDataProcessor(
+            symbols_fn=lambda: self.symbols,
+            pair_components_fn=lambda: self._pair_components,
+            mark_prices=self.mark_prices,
+            mark_price_times=self.mark_price_times,
+            logged_initial_price=self._logged_initial_price,
+            record_ws_data_activity_fn=self._record_ws_data_activity,
+            log_symbol_state_fn=lambda symbol: self._log_symbol_state(symbol),
+            maybe_refresh_runtime_atr_fn=lambda symbol: self._maybe_refresh_runtime_atr(symbol),
+            maybe_refresh_runtime_atr_4h_fn=lambda symbol: self._maybe_refresh_runtime_atr_4h(symbol),
+            refresh_trailing_stop_channel_fn=lambda symbol: self._refresh_trailing_stop_channel(symbol),
+            check_trailing_stop_fn=lambda symbol, price: self._ct_check_trailing_stop(symbol, price),
+            use_clustering_for_symbol_fn=lambda symbol: self._use_clustering_for_symbol(symbol),
+            check_signals_clustering_fn=lambda symbol: self._ct_check_signals_clustering(symbol),
+            is_pair_trading_fn=lambda symbol: self._is_pair_trading(symbol),
+            is_pair_symbol_fn=lambda symbol: self._is_pair_symbol(symbol),
+            check_signals_fn=lambda symbol: self._ct_check_signals(symbol),
+            check_signals_4h_fn=lambda symbol: self._ct_check_signals_4h(symbol),
+            check_breakout_fn=lambda symbol: self._ct_check_breakout(symbol),
+        )
+        self._signal_coordinator = SignalCoordinator(
+            mark_prices=self.mark_prices,
+            mark_price_times=self.mark_price_times,
+            benchmark=self.benchmark,
+            trailing_stop=self.trailing_stop,
+            last_atr_state=self.last_atr_state,
+            last_clustering_state=self.last_clustering_state,
+            last_alert_time=self.last_alert_time,
+            last_st_state=self.last_st_state,
+            clustering_states=self.clustering_states,
+            breakout_monitor=self.breakout_monitor,
+            kline_cache_15m=self.kline_cache_15m,
+            send_webhook_fn=self._send_webhook_current,
+            increment_alert_count_fn=self._increment_alert_count,
+            send_event_fn=self._send_event_current,
+            refresh_trailing_stop_channel_fn=self._refresh_trailing_stop_channel_current,
+            start_breakout_monitor_fn=self._start_breakout_monitor_impl,
+            stop_breakout_monitor_fn=self._stop_breakout_monitor_impl,
+            is_pair_symbol_fn=self._is_pair_symbol,
+            get_ws_fn=lambda: self._hl_ws,
+            update_15m_atr_fn=self._ct_update_15m_atr,
+            fetch_pair_klines_fn=self._fetch_pair_klines_current,
+            atr1h_ma_type=self.atr1h_ma_type,
+            atr1h_period=self.atr1h_period,
+            atr1h_mult=self.atr1h_mult,
+            atr15m_ma_type=self.atr15m_ma_type,
+            atr15m_period=self.atr15m_period,
+            atr15m_mult=self.atr15m_mult,
+            clustering_min_mult=self.clustering_min_mult,
+            clustering_max_mult=self.clustering_max_mult,
+            clustering_step=self.clustering_step,
+            clustering_perf_alpha=self.clustering_perf_alpha,
+            clustering_from_cluster=self.clustering_from_cluster,
+            clustering_max_iter=self.clustering_max_iter,
+            disable_single_trailing=self.disable_single_trailing,
+            disable_pair_trailing=self.disable_pair_trailing,
+            proxy_enable=self.proxy_enable,
+            proxy_url=self.proxy_url,
+            breakout_direction_long=BREAKOUT_DIRECTION_LONG,
+            breakout_direction_short=BREAKOUT_DIRECTION_SHORT,
+            min_trailing_klines=MIN_TRAILING_KLINES,
+        )
+        self._ws_runtime_supervisor = WSRuntimeSupervisor(
+            should_run_fn=lambda: self._hl_ws_running and self._hl_ws is not None,
+            check_data_silence_fn=lambda: self._check_ws_data_silence(),
+            receive_message_fn=lambda: self._receive_hyperliquid_ws_message(),
+            send_ping_fn=lambda: self._send_hyperliquid_ping(),
+            reconnect_fn=lambda reason: self._reconnect_hyperliquid_ws(reason),
+            mark_message_received_fn=lambda now: self._record_ws_message(now),
+            process_payload_fn=lambda data: self._market_data_processor.process_payload(data),
+        )
 
     def _touch_heartbeat_file(self) -> None:
         """Persist a lightweight heartbeat timestamp for external monitors."""
@@ -259,6 +358,167 @@ class NotificationService:
             self._last_heartbeat_write_time = now
         except Exception as e:
             logger.warning("Failed to write heartbeat file %s: %s", self.heartbeat_file, e)
+
+    async def _record_ws_data_activity(self, now: float) -> None:
+        """Record fresh market data activity and update external health state."""
+        self._last_ws_data_time = now
+        await self._notify_ws_data_recovered(now)
+        self._touch_heartbeat_file()
+
+    def _record_ws_message(self, now: float) -> None:
+        """Record receipt of any websocket message for observability."""
+        self._last_ws_message_time = now
+
+    async def _receive_hyperliquid_ws_message(self) -> aiohttp.WSMessage:
+        """Receive next websocket message from the active Hyperliquid stream."""
+        if self._hl_ws is None:
+            raise ConnectionError("ws unavailable")  # noqa: TRY003
+        return await self.market_gateway.receive_ws_message(self._hl_ws)
+
+    async def _send_webhook_current(self, alert_type: str, message: str, extra: dict[str, Any] | None = None) -> None:
+        """Invoke the current webhook connector to support monkeypatch-friendly delegation."""
+        await self._send_webhook(alert_type, message, extra)
+
+    async def _send_event_current(self, event: AlertEvent) -> None:
+        """Invoke the current structured event facade."""
+        await self.send_event(event)
+
+    async def _refresh_trailing_stop_channel_current(self, symbol: str, force: bool = False) -> None:
+        """Invoke the current trailing-stop refresh implementation."""
+        await self._refresh_trailing_stop_channel(symbol, force)
+
+    async def _fetch_pair_klines_current(
+        self,
+        symbol: str,
+        limit: int = 500,
+        interval: str = "1h",
+        proxy: str | None = None,
+        kline_cache: dict[str, Any] | None = None,
+        _fetch_klines_fn: Any = None,
+    ) -> list[Kline]:
+        """Invoke the current pair-kline fetcher while preserving test monkeypatching."""
+        return await self._hl_fetch_pair_klines(symbol, limit, interval, proxy, kline_cache, _fetch_klines_fn)
+
+    async def _start_breakout_monitor_impl(
+        self, symbol: str, direction: str, price: float, trigger_time: float
+    ) -> None:
+        """Actual breakout monitor startup implementation used by the coordinator."""
+        proxy = self.proxy_url if self.proxy_enable else None
+        await start_breakout_monitor(
+            symbol,
+            direction,
+            price,
+            trigger_time,
+            self.breakout_monitor,
+            self._is_pair_symbol(symbol),
+            self.mark_prices,
+            self._hl_ws,
+            self._ct_update_15m_atr,
+            fetch_pair_klines_fn=self._fetch_pair_klines_current,
+            proxy=proxy,
+        )
+        monitor = self.breakout_monitor.get(symbol)
+        if monitor:
+            history = monitor.get("klines_15m", [])
+            if isinstance(history, list) and history:
+                self.kline_cache_15m[symbol] = history
+
+    async def _stop_breakout_monitor_impl(self, symbol: str) -> None:
+        """Actual breakout monitor stop implementation used by the coordinator."""
+        self.breakout_monitor.pop(symbol, None)
+
+    def _create_rest_client(self) -> HyperliquidREST:
+        """Create REST client using unified network settings."""
+        return self.market_gateway.create_rest_client()
+
+    async def send_event(self, event: AlertEvent) -> None:
+        """Public structured alert facade for callers that already build AlertEvent."""
+        await self._alert_dispatcher.send_event(event)
+
+    async def send_alert(self, alert_type: str, message: str, extra: dict[str, Any] | None = None) -> None:
+        """Public alert sending facade for callers outside the service internals."""
+        await self._alert_dispatcher.send_alert(alert_type, message, extra)
+
+    def _cleanup_symbol_state(self, symbol: str) -> None:
+        """Remove symbol-scoped runtime state to avoid stale data retention."""
+        for mapping in (
+            self.mark_prices,
+            self.mark_price_times,
+            self.kline_cache,
+            self.kline_cache_4h,
+            self.kline_cache_15m,
+            self.benchmark,
+            self.last_st_state,
+            self.last_atr_state,
+            self.last_atr4h_state,
+            self.last_kline_time,
+            self.breakout_monitor,
+            self.trailing_stop,
+            self.last_atr1h_ch,
+            self.clustering_states,
+            self.last_clustering_state,
+            self._last_atr_refresh_attempt,
+            self._last_atr4h_refresh_attempt,
+            self._last_trailing_refresh_attempt,
+        ):
+            mapping.pop(symbol, None)
+
+        for alert_key in (
+            f"ATR_Ch_{symbol}",
+            f"ATR_4H_{symbol}",
+            f"ClusterST_{symbol}",
+            symbol,
+        ):
+            self.last_alert_time.pop(alert_key, None)
+
+    def _prune_runtime_state(self) -> None:
+        """Prune stale symbol state that no longer belongs to configured symbols."""
+        configured_symbols = set(self.symbols)
+        pair_components = {component for pair in self._pair_components.values() for component in pair}
+        market_symbols = configured_symbols | pair_components
+
+        market_mappings: tuple[MutableMapping[str, Any], ...] = (
+            self.mark_prices,
+            self.mark_price_times,
+            self.kline_cache,
+            self.kline_cache_15m,
+        )
+        for mapping in market_mappings:
+            stale_keys = [key for key in mapping if key not in market_symbols]
+            for key in stale_keys:
+                mapping.pop(key, None)
+
+        benchmark_mappings: tuple[MutableMapping[str, Any], ...] = (self.kline_cache_4h, self.benchmark)
+        for mapping in benchmark_mappings:
+            stale_keys = [key for key in mapping if key not in configured_symbols]
+            for key in stale_keys:
+                mapping.pop(key, None)
+
+        tracked_symbol_mappings: tuple[MutableMapping[str, Any], ...] = (
+            self.last_st_state,
+            self.last_atr_state,
+            self.last_atr4h_state,
+            self.last_kline_time,
+            self.breakout_monitor,
+            self.trailing_stop,
+            self.last_atr1h_ch,
+            self.clustering_states,
+            self.last_clustering_state,
+            self._last_atr_refresh_attempt,
+            self._last_atr4h_refresh_attempt,
+            self._last_trailing_refresh_attempt,
+        )
+        for mapping in tracked_symbol_mappings:
+            stale_keys = [key for key in mapping if key not in configured_symbols]
+            for key in stale_keys:
+                mapping.pop(key, None)
+
+        valid_alert_keys = set(configured_symbols)
+        for symbol in configured_symbols:
+            valid_alert_keys.update({f"ATR_Ch_{symbol}", f"ATR_4H_{symbol}", f"ClusterST_{symbol}"})
+        stale_alert_keys = [key for key in self.last_alert_time if key not in valid_alert_keys]
+        for key in stale_alert_keys:
+            self.last_alert_time.pop(key, None)
 
     def _is_ws_data_silent(self, now: float | None = None) -> bool:
         """Return whether market data stream has been silent beyond threshold."""
@@ -289,8 +549,8 @@ class NotificationService:
         self._ws_silence_started_at = time.time()
         with suppress(Exception):
             await self._send_webhook(
-                "ERROR",
-                f"Hyperliquid market data silent for {silence_seconds}s. Reconnecting...",
+                ALERT_ERROR,
+                format_ws_data_silence_message(silence_seconds),
             )
 
     async def _notify_ws_data_recovered(self, recovered_at: float | None = None) -> None:
@@ -303,8 +563,8 @@ class NotificationService:
         self._ws_silence_started_at = 0.0
         with suppress(Exception):
             await self._send_webhook(
-                "SYSTEM",
-                f"Hyperliquid market data resumed after {silence_duration}s silence",
+                ALERT_SYSTEM,
+                format_ws_data_resumed_message(silence_duration),
             )
 
     def _use_clustering_for_symbol(self, symbol: str) -> bool:
@@ -430,11 +690,11 @@ class NotificationService:
                 self.last_alert_time[alert_key] = now
                 self.last_atr4h_state[symbol] = {"ch": 1, "sent": "LONG"}
                 await self._send_webhook(
-                    "ATR_Ch",
-                    f"[{symbol}] 4H LONG",
+                    ALERT_ATR_CHANNEL,
+                    format_directional_signal_message(symbol, DIRECTION_LONG, "4H"),
                     {
                         "symbol": symbol,
-                        "direction": "LONG",
+                        "direction": DIRECTION_LONG,
                         "timeframe": "4H",
                         "price": current_price,
                         "atr_upper": atr_upper,
@@ -449,11 +709,11 @@ class NotificationService:
                 self.last_alert_time[alert_key] = now
                 self.last_atr4h_state[symbol] = {"ch": -1, "sent": "SHORT"}
                 await self._send_webhook(
-                    "ATR_Ch",
-                    f"[{symbol}] 4H SHORT",
+                    ALERT_ATR_CHANNEL,
+                    format_directional_signal_message(symbol, DIRECTION_SHORT, "4H"),
                     {
                         "symbol": symbol,
-                        "direction": "SHORT",
+                        "direction": DIRECTION_SHORT,
                         "timeframe": "4H",
                         "price": current_price,
                         "atr_upper": atr_upper,
@@ -538,9 +798,11 @@ class NotificationService:
 
     def _load_config(self, config_path: str) -> dict[str, Any]:
         """Load config from TOML file."""
-        if not Path(config_path).exists():
+        config_file_path = Path(config_path)
+        if not config_file_path.exists():
             raise FileNotFoundError("Config file not found")  # noqa: TRY003
-        return cast(dict[str, Any], toml.load(config_path))
+        with config_file_path.open("rb") as config_file:
+            return tomllib.load(config_file)
 
     def _increment_alert_count(self) -> None:
         """Increment alert count thread-safely."""
@@ -549,15 +811,7 @@ class NotificationService:
 
     async def _send_webhook(self, alert_type: str, message: str, extra: dict[str, Any] | None = None) -> None:
         """Send webhook notification."""
-        await send_webhook(
-            self.webhook_url,
-            self.webhook_format,
-            alert_type,
-            message,
-            extra,
-            self.max_log_lines,
-            self._get_timestamp,
-        )
+        await self.send_alert(alert_type, message, extra)
 
     async def connect(self) -> None:
         """Connect WebSocket and subscribe to all trading pairs."""
@@ -565,38 +819,27 @@ class NotificationService:
             await self._check_hyperliquid_connection()
             await self._connect_hyperliquid_ws()
             self.connected = True
-            await self._send_webhook("SYSTEM", f"hypurr-monitor connected to {self._exchange_id}")
+            await self._send_webhook(ALERT_SYSTEM, format_connection_success_message(self._exchange_id))
         except Exception as e:
-            await self._send_webhook("ERROR", f"Connection failed: {e}")
+            await self._send_webhook(ALERT_ERROR, format_connection_failed_message(e))
             raise
 
     async def _check_hyperliquid_connection(self) -> None:
         """Check Hyperliquid REST API connectivity with retry."""
-        max_retries = 5
-        base_delay = 2
-        http_ok = 200
+        max_retries = self.network.rest.retry.max_retries + 1
 
         for attempt in range(1, max_retries + 1):
             try:
-                async with (
-                    aiohttp.ClientSession() as session,
-                    session.post(
-                        "https://api.hyperliquid.xyz/info",
-                        json={"type": "meta"},
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as resp,
-                ):
-                    if resp.status == http_ok:
-                        logger.info("Hyperliquid API connectivity check passed")
-                        return
-                    logger.warning(
-                        "Hyperliquid API returned status %s, attempt %s/%s", resp.status, attempt, max_retries
-                    )
+                data = await self.market_gateway.check_connectivity()
+                if isinstance(data, dict):
+                    logger.info("Hyperliquid API connectivity check passed")
+                    return
+                logger.warning("Hyperliquid API returned unexpected payload, attempt %s/%s", attempt, max_retries)
             except Exception as e:
                 logger.warning("Hyperliquid connectivity check failed: %s, attempt %s/%s", e, attempt, max_retries)
 
             if attempt < max_retries:
-                delay = base_delay * (2 ** (attempt - 1))
+                delay = self.network.rest.retry.base_delay_seconds * (2 ** (attempt - 1))
                 logger.info("Retrying in %ss...", delay)
                 await asyncio.sleep(delay)
 
@@ -604,34 +847,19 @@ class NotificationService:
         logger.error(msg)
         raise ConnectionError(msg)
 
-    async def _subscribe_hyperliquid_all_mids(self) -> None:
-        """Subscribe to all configured Hyperliquid allMids feeds."""
-        if not self._hl_ws:
-            raise ConnectionError("ws unavailable")  # noqa: TRY003
-        for dex in ["", "xyz", "hyna", "flx", "vntl", "km", "cash", "para"]:
-            if dex:
-                sub = {"method": "subscribe", "subscription": {"type": "allMids", "dex": dex}}
-            else:
-                sub = {"method": "subscribe", "subscription": {"type": "allMids"}}
-            await self._hl_ws.send_json(sub)
-
     async def _close_hyperliquid_ws(self) -> None:
         """Close current Hyperliquid websocket resources."""
         ws = getattr(self, "_hl_ws", None)
-        self._hl_ws = None
-        if ws and not ws.closed:
-            await ws.close()
-
         session = getattr(self, "_hl_session", None)
+        self._hl_ws = None
         self._hl_session = None
-        if session and not session.closed:
-            await session.close()
+        await self.market_gateway.close_ws_resources(session, ws)
 
     async def _send_hyperliquid_ping(self) -> None:
         """Send websocket ping heartbeat to keep connection alive."""
         if not self._hl_ws:
             raise ConnectionError("ws unavailable")  # noqa: TRY003
-        await self._hl_ws.send_json({"method": "ping"})
+        await self.market_gateway.send_ws_ping(self._hl_ws)
 
     async def _notify_ws_reconnect_failure(self, reason: str) -> None:
         """Send a single webhook when websocket enters reconnect mode."""
@@ -639,7 +867,7 @@ class NotificationService:
             return
         self._ws_reconnect_alert_active = True
         with suppress(Exception):
-            await self._send_webhook("ERROR", f"Hyperliquid WS disconnected: {reason}. Reconnecting...")
+            await self._send_webhook(ALERT_ERROR, format_ws_reconnect_failure_message(reason))
 
     async def _notify_ws_reconnect_success(self, reason: str, attempt: int) -> None:
         """Send webhook when websocket recovers from reconnect mode."""
@@ -647,12 +875,12 @@ class NotificationService:
             return
         self._ws_reconnect_alert_active = False
         with suppress(Exception):
-            await self._send_webhook("SYSTEM", f"Hyperliquid WS reconnected after {reason} (attempt {attempt})")
+            await self._send_webhook(ALERT_SYSTEM, format_ws_reconnect_success_message(reason, attempt))
 
     async def _reconnect_hyperliquid_ws(self, reason: str) -> bool:
         """Reconnect Hyperliquid websocket with exponential backoff."""
         self.connected = False
-        delay = WS_RECONNECT_BASE_DELAY_SECONDS
+        delay = self.network.ws.reconnect_base_delay_seconds
         attempt = 0
 
         while self._hl_ws_running:
@@ -671,7 +899,7 @@ class NotificationService:
                 if not self._hl_ws_running:
                     return False
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, WS_RECONNECT_MAX_DELAY_SECONDS)
+                delay = min(delay * 2, self.network.ws.reconnect_max_delay_seconds)
 
         return False
 
@@ -682,113 +910,14 @@ class NotificationService:
         self._last_ws_message_time = now
         self._last_ws_data_time = now
 
-        self._hl_session = aiohttp.ClientSession()
-        session = self._hl_session
-        self._hl_ws = await session.ws_connect(
-            "wss://api.hyperliquid.xyz/ws",
-            timeout=aiohttp.ClientWSTimeout(ws_receive=WS_CONNECT_RECEIVE_TIMEOUT_SECONDS),
-        )
-
-        await self._subscribe_hyperliquid_all_mids()
+        self._hl_session, self._hl_ws = await self.market_gateway.open_mark_price_stream("wss://api.hyperliquid.xyz/ws")
 
         if start_watch_task:
             self._ws_tasks = [asyncio.create_task(self._watch_hyperliquid_marks())]
 
-    async def _watch_hyperliquid_marks(self) -> None:  # noqa: PLR0912,PLR0915
+    async def _watch_hyperliquid_marks(self) -> None:
         """Receive mark price updates from Hyperliquid WebSocket."""
-        while self._hl_ws_running and self._hl_ws:
-            if await self._check_ws_data_silence():
-                continue
-            try:
-                msg = await asyncio.wait_for(self._hl_ws.receive(), timeout=WS_RECEIVE_IDLE_TIMEOUT_SECONDS)
-            except TimeoutError:
-                if await self._check_ws_data_silence():
-                    continue
-                try:
-                    await self._send_hyperliquid_ping()
-                except Exception:
-                    logger.exception("Hyperliquid WS ping failed")
-                    if not await self._reconnect_hyperliquid_ws("ping timeout"):
-                        break
-                continue
-            except Exception:
-                logger.exception("Hyperliquid WS receive error")
-                if not await self._reconnect_hyperliquid_ws("receive error"):
-                    break
-                continue
-
-            try:
-                self._last_ws_message_time = time.time()
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = orjson.loads(msg.data)
-                    if data.get("channel") == "allMids":
-                        mids = data.get("data", {}).get("mids", {})
-                        if mids:
-                            now = time.time()
-                            self._last_ws_data_time = now
-                            await self._notify_ws_data_recovered(now)
-                            self._touch_heartbeat_file()
-                        updated_symbols: set[str] = set()
-                        for sym in self.symbols:
-                            if sym in mids:
-                                price = float(mids[sym])
-                                self.mark_prices[sym] = price
-                                self.mark_price_times[sym] = time.time()
-                                updated_symbols.add(sym)
-                        for c1, c2 in self._pair_components.values():
-                            if c1 in mids and c1 not in updated_symbols:
-                                self.mark_prices[c1] = float(mids[c1])
-                                self.mark_price_times[c1] = time.time()
-                                updated_symbols.add(c1)
-                            if c2 in mids and c2 not in updated_symbols:
-                                self.mark_prices[c2] = float(mids[c2])
-                                self.mark_price_times[c2] = time.time()
-                                updated_symbols.add(c2)
-                        for sym in updated_symbols:
-                            if sym not in self._logged_initial_price:
-                                self._logged_initial_price.add(sym)
-                                self._log_symbol_state(sym)
-                            price = self.mark_prices.get(sym, 0)
-                            if price <= 0:
-                                continue
-                            if not self._is_pair_trading(sym) and not self._is_pair_symbol(sym):
-                                await self._maybe_refresh_runtime_atr(sym)
-                                await self._maybe_refresh_runtime_atr_4h(sym)
-                            await self._refresh_trailing_stop_channel(sym)
-                            await self._ct_check_trailing_stop(sym, price)
-                            if self._use_clustering_for_symbol(sym):
-                                await self._ct_check_signals_clustering(sym)
-                            elif not self._is_pair_trading(sym) and not self._is_pair_symbol(sym):
-                                await self._ct_check_signals(sym)
-                                await self._ct_check_signals_4h(sym)
-                        for pair_sym, (c1, c2) in self._pair_components.items():
-                            p1 = self.mark_prices.get(c1, 0)
-                            p2 = self.mark_prices.get(c2, 0)
-                            if p1 > 0 and p2 > 0:
-                                pair_price = p1 / p2
-                                self.mark_prices[pair_sym] = pair_price
-                                self.mark_price_times[pair_sym] = time.time()
-                                if pair_sym not in self._logged_initial_price:
-                                    self._logged_initial_price.add(pair_sym)
-                                    self._log_symbol_state(pair_sym)
-                                if not self._use_clustering_for_symbol(pair_sym):
-                                    await self._maybe_refresh_runtime_atr(pair_sym)
-                                    await self._maybe_refresh_runtime_atr_4h(pair_sym)
-                                    await self._refresh_trailing_stop_channel(pair_sym)
-                                await self._ct_check_trailing_stop(pair_sym, pair_price)
-                                if self._use_clustering_for_symbol(pair_sym):
-                                    await self._ct_check_signals_clustering(pair_sym)
-                                else:
-                                    await self._ct_check_signals(pair_sym)
-                                    await self._ct_check_signals_4h(pair_sym)
-                    elif data.get("channel") == "pong":
-                        logger.debug("Hyperliquid WS pong received")
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    logger.warning("Hyperliquid WS closed with message type %s", msg.type.name)
-                    if not await self._reconnect_hyperliquid_ws(f"message {msg.type.name}"):
-                        break
-            except Exception:
-                logger.exception("Hyperliquid WS message handling error")
+        await self._ws_runtime_supervisor.run()
 
     async def _on_ticker(self, symbol: str, ticker: dict[str, Any]) -> None:
         """Handle ticker update."""
@@ -819,75 +948,31 @@ class NotificationService:
     async def _ct_check_trailing_stop(self, symbol: str, price: float) -> None:
         """Connector: bridge check_trailing_stop to instance method."""
         is_pair = self._is_pair_symbol(symbol)
-        if is_pair and self.disable_pair_trailing:
-            return
-        if not is_pair and self.disable_single_trailing:
-            return
-        await check_trailing_stop(
-            symbol,
-            price,
-            self.trailing_stop,
-            self._send_webhook,
-            self._increment_alert_count,
-            self.last_alert_time,
-        )
+        await self._signal_coordinator.check_trailing_stop(symbol, price, is_pair)
 
     async def _ct_check_signals(self, symbol: str) -> None:
         """Connector: bridge check_signals to instance method."""
-        had_active_trailing = bool(self.trailing_stop.get(symbol, {}).get("active"))
-        await check_signals(
-            symbol,
-            self.mark_prices,
-            self.mark_price_times,
-            self.benchmark,
-            self.trailing_stop,
-            self.last_atr_state,
-            self.last_alert_time,
-            self._initialized,
-            self.last_st_state,
-            self.atr1h_ma_type,
-            self.atr1h_period,
-            self.atr1h_mult,
-            self.atr15m_ma_type,
-            self.atr15m_period,
-            self.atr15m_mult,
-            self._send_webhook,
-            self._increment_alert_count,
-        )
-        has_new_atr_trailing = bool(self.trailing_stop.get(symbol, {}).get("active")) and not bool(
-            self.trailing_stop.get(symbol, {}).get("use_clustering_ts")
-        )
-        if not had_active_trailing and has_new_atr_trailing:
-            await self._refresh_trailing_stop_channel(symbol, force=True)
+        await self._signal_coordinator.check_signals(symbol, self._initialized)
 
     async def _ct_check_signals_clustering(self, symbol: str) -> None:
         """Connector: bridge check_signals_clustering to instance method."""
-        await check_signals_clustering(
-            symbol,
-            self.mark_prices,
-            self.mark_price_times,
-            self.benchmark,
-            self.trailing_stop,
-            self.last_clustering_state,
-            self.last_alert_time,
-            self._initialized,
-            self.last_st_state,
-            self.clustering_states,
-            self.atr1h_ma_type,
-            self.atr1h_period,
-            self.atr1h_mult,
-            self.atr15m_ma_type,
-            self.atr15m_period,
-            self.atr15m_mult,
-            self.clustering_min_mult,
-            self.clustering_max_mult,
-            self.clustering_step,
-            self.clustering_perf_alpha,
-            self.clustering_from_cluster,
-            self.clustering_max_iter,
-            self._send_webhook,
-            self._increment_alert_count,
-        )
+        await self._signal_coordinator.check_signals_clustering(symbol, self._initialized)
+
+    async def _ct_start_breakout_monitor(self, symbol: str, direction: str, price: float, trigger_time: float) -> None:
+        """Connector: start breakout monitoring with service-owned dependencies."""
+        await self._signal_coordinator.start_breakout_monitor(symbol, direction, price, trigger_time)
+
+    def _sync_breakout_monitor_from_cache(self, symbol: str) -> None:
+        """Advance breakout monitor using cached 15m klines refreshed elsewhere in runtime."""
+        self._signal_coordinator.sync_breakout_monitor_from_cache(symbol)
+
+    async def _ct_check_breakout(self, symbol: str) -> None:
+        """Connector: route breakout notifications through structured service alerts."""
+        await self._signal_coordinator.check_breakout(symbol)
+
+    async def _stop_breakout_monitor(self, symbol: str) -> None:
+        """Stop breakout monitoring for a symbol."""
+        self.breakout_monitor.pop(symbol, None)
 
     async def _get_component_klines(
         self,
@@ -898,6 +983,7 @@ class NotificationService:
         kline_cache: dict[str, Any] | None,
     ) -> list[Kline]:
         """Get klines for a component symbol, checking global cache first."""
+        _ = proxy
         _min_klines = 200
         cached = get_cached_klines(sym, interval)
         if cached and len(cached) >= _min_klines:
@@ -905,7 +991,7 @@ class NotificationService:
         local: list[Kline] | None = kline_cache.get(sym) if kline_cache else None
         if local and len(local) >= _min_klines:
             return local
-        client = HyperliquidREST(proxy=proxy)
+        client = self._create_rest_client()
         try:
             klines = await client.fetch_klines(sym, interval=interval, limit=limit)
         finally:
@@ -916,7 +1002,8 @@ class NotificationService:
 
     async def _hl_fetch_klines(self, symbol: str, proxy: str | None = None) -> list[Kline]:
         """Fetch K-lines using native Hyperliquid REST API."""
-        client = HyperliquidREST(proxy=proxy)
+        _ = proxy
+        client = self._create_rest_client()
         try:
             return await client.fetch_klines(symbol, interval="1h", limit=500)
         finally:
@@ -1063,8 +1150,9 @@ class NotificationService:
         """Initialize service: fetch all K-lines and calculate indicators."""
         logger.info(f"Initializing klines for {len(self.symbols)} symbols...")
         self._initialized = False
+        self._prune_runtime_state()
 
-        await fetch_meta(proxy=self.proxy_url if self.proxy_enable else None)
+        await self.market_gateway.fetch_meta()
 
         for symbol in self.single_list:
             await self._ct_update_klines(symbol)
@@ -1182,7 +1270,7 @@ class NotificationService:
                 )
 
         msg = "READY\n" + "\n".join(lines)
-        await self._send_webhook("SYSTEM", msg)
+        await self._send_webhook(ALERT_SYSTEM, msg)
 
     async def run(self) -> None:
         """Main service run loop."""
@@ -1202,7 +1290,14 @@ class NotificationService:
         """Stop service."""
         self.running = False
         self._hl_ws_running = False
+        for task in self._ws_tasks:
+            if not task.done():
+                task.cancel()
+        if self._ws_tasks:
+            await asyncio.gather(*self._ws_tasks, return_exceptions=True)
+            self._ws_tasks.clear()
         await self._close_hyperliquid_ws()
+        await self._webhook_sender.close()
         if self.observer:
             self.observer.stop()
             self.observer.join()

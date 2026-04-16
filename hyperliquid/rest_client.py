@@ -21,6 +21,7 @@ from typing import Any
 
 import aiohttp
 
+from config.network import RestNetworkConfig
 from models import Kline
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,9 @@ _meta_cache_time: float = 0.0
 async def fetch_meta(
     proxy: str | None = None,
     force_refresh: bool = False,
+    timeout_seconds: float = TIMEOUT / 1000,
+    max_retries: int = 0,
+    retry_base_delay_seconds: float = 1.0,
 ) -> dict[str, Any]:
     """
     Fetch meta info (szDecimals for each symbol) from Hyperliquid API.
@@ -90,7 +94,12 @@ async def fetch_meta(
     if not force_refresh and _meta_cache and (now - _meta_cache_time) < _META_CACHE_TTL:
         return _meta_cache
 
-    client = HyperliquidREST(proxy=proxy)
+    client = HyperliquidREST(
+        proxy=proxy,
+        timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+        retry_base_delay_seconds=retry_base_delay_seconds,
+    )
     try:
         payload: dict[str, Any] = {"type": "meta"}
         data = await client._post(payload, weight=1.0)  # noqa: SLF001
@@ -377,28 +386,68 @@ _rate_limiter = RateLimiter2()
 class HyperliquidREST:
     """Hyperliquid REST client using native HTTP API."""
 
-    def __init__(self, proxy: str | None = None) -> None:
+    def __init__(
+        self,
+        proxy: str | None = None,
+        timeout_seconds: float = TIMEOUT / 1000,
+        max_retries: int = 0,
+        retry_base_delay_seconds: float = 1.0,
+        network: RestNetworkConfig | None = None,
+    ) -> None:
+        if network is not None:
+            proxy = network.proxy_url
+            timeout_seconds = network.timeout_seconds
+            max_retries = network.retry.max_retries
+            retry_base_delay_seconds = network.retry.base_delay_seconds
         self.proxy = proxy
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+        self.retry_base_delay_seconds = retry_base_delay_seconds
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=TIMEOUT / 1000)
+            timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
             connector = aiohttp.TCPConnector()
             self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self._session
 
     async def _post(self, payload: dict[str, Any], weight: float = 1.0) -> Any:
-        await _rate_limiter.acquire(weight)
-        session = await self._get_session()
         headers = {"Content-Type": "application/json"}
-        try:
-            async with session.post(BASE_URL, json=payload, headers=headers, proxy=self.proxy) as resp:
-                resp.raise_for_status()
-                return await resp.json()
-        except Exception as e:
-            logger.warning(f"Hyperliquid REST request failed: {e}")
-            raise
+        last_error: Exception | None = None
+
+        for attempt in range(self.max_retries + 1):
+            await _rate_limiter.acquire(weight)
+            session = await self._get_session()
+            try:
+                async with session.post(BASE_URL, json=payload, headers=headers, proxy=self.proxy) as resp:
+                    if resp.status >= 500 or resp.status == 429:  # noqa: PLR2004
+                        resp.raise_for_status()
+                    resp.raise_for_status()
+                    return await resp.json()
+            except aiohttp.ClientResponseError as e:
+                last_error = e
+                should_retry = e.status >= 500 or e.status == 429  # noqa: PLR2004
+                if should_retry and attempt < self.max_retries:
+                    delay = self.retry_base_delay_seconds * (2**attempt)
+                    logger.warning("Hyperliquid REST transient response error: %s, retrying in %.1fs", e, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning(f"Hyperliquid REST request failed: {e}")
+                raise
+            except (aiohttp.ClientError, TimeoutError, OSError) as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    delay = self.retry_base_delay_seconds * (2**attempt)
+                    logger.warning("Hyperliquid REST transport error: %s, retrying in %.1fs", e, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning(f"Hyperliquid REST request failed: {e}")
+                raise
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Hyperliquid REST request failed without error")  # noqa: TRY003
 
     async def fetch_klines(
         self,

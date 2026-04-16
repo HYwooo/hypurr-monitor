@@ -10,9 +10,14 @@ if [[ $# -ge 1 && "$1" == *.toml ]]; then
   shift
 fi
 
-CONFIG_PATH="$ROOT_DIR/$CONFIG_FILE"
-PID_FILE="$ROOT_DIR/hypurr-monitor.pid"
-LOG_FILE="$ROOT_DIR/hypurr-monitor.log"
+if [[ "$CONFIG_FILE" = /* ]]; then
+  CONFIG_PATH="$CONFIG_FILE"
+else
+  CONFIG_PATH="$ROOT_DIR/$CONFIG_FILE"
+fi
+CONFIG_DIR="$(cd "$(dirname "$CONFIG_PATH")" && pwd)"
+PID_FILE="$CONFIG_DIR/hypurr-monitor.pid"
+LOG_FILE="$CONFIG_DIR/hypurr-monitor.log"
 
 read_config_value() {
   local key="$1"
@@ -50,7 +55,7 @@ HEARTBEAT_TIMEOUT="$(read_config_value "service.heartbeat_timeout" "120")"
 if [[ "$HEARTBEAT_FILE_RAW" = /* ]]; then
   HEARTBEAT_FILE="$HEARTBEAT_FILE_RAW"
 else
-  HEARTBEAT_FILE="$ROOT_DIR/$HEARTBEAT_FILE_RAW"
+  HEARTBEAT_FILE="$CONFIG_DIR/$HEARTBEAT_FILE_RAW"
 fi
 
 is_running() {
@@ -82,31 +87,7 @@ heartbeat_age() {
 }
 
 print_status() {
-  local pid age
-  pid="$(read_pid)"
-  if [[ -z "$pid" ]]; then
-    echo "hypurr-monitor is NOT running (no PID file)"
-    return 1
-  fi
-
-  if ! is_running "$pid"; then
-    echo "hypurr-monitor is NOT running (stale PID file: $pid)"
-    return 1
-  fi
-
-  age="$(heartbeat_age)"
-  if [[ "$age" -lt 0 ]]; then
-    echo "hypurr-monitor is RUNNING (PID: $pid), but heartbeat file is missing or invalid: $HEARTBEAT_FILE"
-    return 1
-  fi
-
-  if [[ "$age" -gt "$HEARTBEAT_TIMEOUT" ]]; then
-    echo "hypurr-monitor is RUNNING (PID: $pid), but heartbeat is STALE: ${age}s > ${HEARTBEAT_TIMEOUT}s"
-    return 1
-  fi
-
-  echo "hypurr-monitor is RUNNING (PID: $pid), heartbeat OK: ${age}s <= ${HEARTBEAT_TIMEOUT}s"
-  return 0
+  uv run python "$ROOT_DIR/main.py" --config "$CONFIG_PATH" --status
 }
 
 start() {

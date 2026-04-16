@@ -9,6 +9,7 @@ Main functions:
 """
 
 import logging
+import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,24 +21,62 @@ logger = logging.getLogger(__name__)
 
 WEBHOOK_LOG_FILE = "webhook.log"
 LOG_RETENTION_DAYS = 7
+PID_FILE = "hypurr-monitor.pid"
+LOG_FILE = "hypurr-monitor.log"
+DEBUG_LOG_FILE = "debug.log"
+ERROR_LOG_FILE = "error.log"
+
+_SHORT_TZ_RE = re.compile(r"([+-]\d{2})(\d{2})$")
 
 
-def cleanup_old_logs() -> None:
+def resolve_path_from_config(config_path: str, raw_path: str) -> str:
+    """Resolve relative runtime path against config directory."""
+    path = Path(raw_path)
+    if path.is_absolute():
+        return str(path)
+    return str(Path(config_path).resolve().parent / path)
+
+
+def get_runtime_paths(config_path: str) -> dict[str, str]:
+    """Resolve runtime files relative to config directory."""
+    config_dir = Path(config_path).resolve().parent
+    service_config: dict[str, Any] = {}
+    config_file = Path(config_path)
+    if config_file.exists():
+        service_config = load_config(config_path).get("service", {})
+    heartbeat_file = str(service_config.get("heartbeat_file", "heartbeat"))
+    return {
+        "pid": str(config_dir / PID_FILE),
+        "log": str(config_dir / LOG_FILE),
+        "debug": str(config_dir / DEBUG_LOG_FILE),
+        "error": str(config_dir / ERROR_LOG_FILE),
+        "webhook": str(config_dir / WEBHOOK_LOG_FILE),
+        "heartbeat": resolve_path_from_config(config_path, heartbeat_file),
+    }
+
+
+def _parse_webhook_timestamp(log_time_str: str) -> datetime:
+    """Parse webhook timestamp in both +0800 and +08:00 forms."""
+    normalized = _SHORT_TZ_RE.sub(r"\1:\2", log_time_str)
+    return datetime.fromisoformat(normalized).astimezone(UTC)
+
+
+def cleanup_old_logs(log_file_path: str | None = None) -> None:
     """
     Clean up logs in WEBHOOK_LOG_FILE older than LOG_RETENTION_DAYS.
     Parses date from each line's [timestamp], deletes lines past cutoff time.
     """
     try:
-        webhook_path = Path(WEBHOOK_LOG_FILE)
+        webhook_path = Path(log_file_path or WEBHOOK_LOG_FILE)
         if not webhook_path.exists():
             return
         cutoff_time = time.time() - (LOG_RETENTION_DAYS * 24 * 3600)
-        temp_file = Path(WEBHOOK_LOG_FILE + ".tmp")
+        temp_file = Path(str(webhook_path) + ".tmp")
         with webhook_path.open(encoding="utf-8") as f_in, temp_file.open("w", encoding="utf-8") as f_out:
             for line in f_in:
                 try:
                     log_time_str = line.split("]")[0].strip("[")
-                    log_time = datetime.strptime(log_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                    log_time = _parse_webhook_timestamp(log_time_str)
                     if log_time.timestamp() > cutoff_time:
                         f_out.write(line)
                 except Exception:
@@ -179,6 +218,25 @@ def create_config(
         "proxy": {
             "enable": False,
             "url": "",
+        },
+        "network": {
+            "rest": {
+                "timeout_seconds": 30,
+                "max_retries": 2,
+                "base_delay_seconds": 1,
+            },
+            "ws": {
+                "connect_timeout_seconds": 65,
+                "receive_timeout_seconds": 65,
+                "idle_timeout_seconds": 25,
+                "reconnect_base_delay_seconds": 2,
+                "reconnect_max_delay_seconds": 30,
+            },
+            "webhook": {
+                "timeout_seconds": 10,
+                "max_retries": 2,
+                "base_delay_seconds": 1,
+            },
         },
         "report": {
             "enable": False,

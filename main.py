@@ -5,6 +5,7 @@ Usage:
     uv run python main.py              # Default run (INFO)
     uv run python main.py --debug      # DEBUG mode
     uv run python main.py --daemon     # Run in background
+    uv run python main.py --restart    # Restart daemon
     uv run python main.py --stop       # Stop daemon
     uv run python main.py --status     # Check daemon status
 """
@@ -17,10 +18,12 @@ import subprocess
 import sys
 import time
 import traceback
+from contextlib import suppress
 from pathlib import Path
 
-from config import cleanup_old_logs, create_config, load_config, update_symbols
+from config import cleanup_old_logs, create_config, load_config, resolve_path_from_config, update_symbols
 from logging_config import get_logger, setup_logging
+from notifications import ALERT_ERROR, build_alert_event
 from service import NotificationService
 
 logger = get_logger(__name__)
@@ -30,14 +33,20 @@ PID_FILE = "hypurr-monitor.pid"
 LOG_FILE = "hypurr-monitor.log"
 
 
-def save_pid(pid: int) -> None:
-    Path(PID_FILE).write_text(str(pid), encoding="utf-8")
+def _runtime_path(config_path: str, raw_path: str) -> Path:
+    """Resolve runtime file path relative to config directory."""
+    return Path(resolve_path_from_config(config_path, raw_path))
 
 
-def read_pid() -> int | None:
-    if Path(PID_FILE).exists():
+def save_pid(pid: int, config_path: str = "config.toml") -> None:
+    _runtime_path(config_path, PID_FILE).write_text(str(pid), encoding="utf-8")
+
+
+def read_pid(config_path: str = "config.toml") -> int | None:
+    pid_path = _runtime_path(config_path, PID_FILE)
+    if pid_path.exists():
         try:
-            return int(Path(PID_FILE).read_text(encoding="utf-8").strip())
+            return int(pid_path.read_text(encoding="utf-8").strip())
         except ValueError:
             return None
     return None
@@ -57,10 +66,7 @@ def _get_heartbeat_status(config_path: str) -> tuple[bool, str]:
     service_config = config.get("service", {})
     heartbeat_file = str(service_config.get("heartbeat_file", "heartbeat"))
     heartbeat_timeout = int(service_config.get("heartbeat_timeout", 120))
-
-    heartbeat_path = Path(heartbeat_file)
-    if not heartbeat_path.is_absolute():
-        heartbeat_path = Path(config_path).resolve().parent / heartbeat_path
+    heartbeat_path = _runtime_path(config_path, heartbeat_file)
 
     if not heartbeat_path.exists():
         return False, f"heartbeat file missing: {heartbeat_path}"
@@ -76,66 +82,79 @@ def _get_heartbeat_status(config_path: str) -> tuple[bool, str]:
     return True, f"heartbeat OK: {age}s <= {heartbeat_timeout}s"
 
 
+def get_status_result(config_path: str) -> tuple[bool, str]:
+    """Return daemon status message and success flag."""
+    pid = read_pid(config_path)
+    if not pid:
+        return False, "hypurr-monitor is NOT running"
+
+    if not is_running(pid):
+        return False, f"hypurr-monitor is NOT running (stale PID file: {pid})"
+
+    heartbeat_ok, heartbeat_message = _get_heartbeat_status(config_path)
+    if heartbeat_ok:
+        return True, f"hypurr-monitor is RUNNING (PID: {pid}), {heartbeat_message}"
+    return False, f"hypurr-monitor is RUNNING (PID: {pid}), but {heartbeat_message}"
+
+
 def cmd_daemon(config_path: str) -> None:
-    pid = read_pid()
+    pid = read_pid(config_path)
     if pid and is_running(pid):
         print(f"hypurr-monitor is already running (PID: {pid})")
         sys.exit(1)
 
-    print("Starting hypurr-monitor in background...")
-    Path(LOG_FILE).write_text("", encoding="utf-8")
-    with Path(LOG_FILE).open("a", encoding="utf-8") as log:
+    log_path = _runtime_path(config_path, LOG_FILE)
+    log_path.write_text("", encoding="utf-8")
+    with log_path.open("a", encoding="utf-8") as log:
         proc = subprocess.Popen(
             [sys.executable, __file__, "--config", config_path, "--debug"],
             stdout=log,
             stderr=log,
             start_new_session=True,
         )
-    save_pid(proc.pid)
+    save_pid(proc.pid, config_path)
     print(f"hypurr-monitor started (PID: {proc.pid})")
-    print(f"Log file: {LOG_FILE}")
+    print(f"log file: {log_path}")
 
 
-def cmd_stop() -> None:
-    pid = read_pid()
+def cmd_stop(config_path: str = "config.toml") -> None:
+    pid = read_pid(config_path)
+    pid_path = _runtime_path(config_path, PID_FILE)
     if not pid:
         print("hypurr-monitor is not running (no PID file)")
         sys.exit(1)
 
     if not is_running(pid):
         print(f"hypurr-monitor is not running (stale PID file: {pid})")
-        Path(PID_FILE).unlink(missing_ok=True)
+        pid_path.unlink(missing_ok=True)
         sys.exit(1)
 
     try:
         os.kill(pid, signal.SIGTERM)
         print(f"hypurr-monitor stopped (PID: {pid})")
-        Path(PID_FILE).unlink(missing_ok=True)
+        pid_path.unlink(missing_ok=True)
     except OSError as e:
         print(f"Failed to stop: {e}")
         sys.exit(1)
 
 
+def cmd_restart(config_path: str) -> None:
+    """Restart daemon with the same semantics as scripts/daemon.sh."""
+    with suppress(SystemExit):
+        cmd_stop(config_path)
+    time.sleep(1)
+    cmd_daemon(config_path)
+
+
 def cmd_status(config_path: str) -> None:
-    pid = read_pid()
-    if not pid:
-        print("hypurr-monitor is NOT running")
-        sys.exit(1)
-
-    if is_running(pid):
-        heartbeat_ok, heartbeat_message = _get_heartbeat_status(config_path)
-        if heartbeat_ok:
-            print(f"hypurr-monitor is RUNNING (PID: {pid}), {heartbeat_message}")
-            return
-        print(f"hypurr-monitor is RUNNING (PID: {pid}), but {heartbeat_message}")
-        sys.exit(1)
-    else:
-        print("hypurr-monitor is NOT running (stale PID file)")
+    ok, message = get_status_result(config_path)
+    print(message)
+    if not ok:
         sys.exit(1)
 
 
-def _rotate_debug_log() -> None:
-    debug_path = Path(DEBUG_LOG_FILE)
+def _rotate_debug_log(config_path: str) -> None:
+    debug_path = _runtime_path(config_path, DEBUG_LOG_FILE)
     if not debug_path.exists():
         return
     try:
@@ -151,7 +170,7 @@ def _rotate_debug_log() -> None:
         logger.warning("[DEBUG LOG] Rotate failed: %s", e)
 
 
-async def main() -> None:
+async def main() -> None:  # noqa: PLR0911
     parser = argparse.ArgumentParser(description="hypurr-monitor")
     parser.add_argument("--config", default="config.toml", help="Config file path")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
@@ -161,6 +180,7 @@ async def main() -> None:
     parser.add_argument("--remove-symbol", help="Remove symbol(s)")
     parser.add_argument("--list-symbols", action="store_true", help="List symbols")
     parser.add_argument("--daemon", action="store_true", help="Run in background")
+    parser.add_argument("--restart", action="store_true", help="Restart daemon")
     parser.add_argument("--stop", action="store_true", help="Stop daemon")
     parser.add_argument("--status", action="store_true", help="Check daemon status")
 
@@ -169,14 +189,21 @@ async def main() -> None:
     if args.daemon:
         cmd_daemon(args.config)
         return
+    if args.restart:
+        cmd_restart(args.config)
+        return
     if args.stop:
-        cmd_stop()
+        cmd_stop(args.config)
         return
     if args.status:
         cmd_status(args.config)
         return
 
-    setup_logging(debug=args.debug)
+    setup_logging(
+        debug=args.debug,
+        debug_log_path=str(_runtime_path(args.config, DEBUG_LOG_FILE)),
+        error_log_path=str(_runtime_path(args.config, "error.log")),
+    )
 
     if args.webhook:
         single = args.symbols.split(",") if args.symbols else None
@@ -198,11 +225,11 @@ async def main() -> None:
         logger.info("pair_list: %s", sym.get("pair_list", []))
         return
 
-    cleanup_old_logs()
+    cleanup_old_logs(str(_runtime_path(args.config, "webhook.log")))
     service = NotificationService(args.config, debug=args.debug)
 
     if args.debug:
-        _rotate_debug_log()
+        _rotate_debug_log(args.config)
 
     try:
         await service.run()
@@ -210,9 +237,11 @@ async def main() -> None:
         logger.info("Keyboard interrupt, stopping...")
     except Exception as e:
         logger.exception("Main error")
-        await service._send_webhook(  # noqa: SLF001
-            "ERROR",
-            f"Main error: {type(e).__name__}: {e!s}\n{traceback.format_exc()}",
+        await service.send_event(
+            build_alert_event(
+                ALERT_ERROR,
+                f"Main error: {type(e).__name__}: {e!s}\n{traceback.format_exc()}",
+            )
         )
     finally:
         await service.stop()

@@ -13,9 +13,11 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
 from hyperliquid.rest_client import (
@@ -24,9 +26,8 @@ from hyperliquid.rest_client import (
     fetch_klines,
 )
 
-pytestmark = pytest.mark.asyncio
 
-
+@pytest.mark.asyncio
 class TestHyperliquidRateLimiter:
     """Test token bucket rate limiter."""
 
@@ -116,6 +117,7 @@ class TestHyperliquidRESTIntervalMs:
         assert client._interval_ms("unknown") == 3_600_000
 
 
+@pytest.mark.asyncio
 class TestHyperliquidRESTFetchKlines:
     """Test K-line fetching with mocked HTTP responses."""
 
@@ -245,6 +247,7 @@ class TestHyperliquidRESTFetchKlines:
         assert payload["req"]["coin"] == "xyz:GOLD"
 
 
+@pytest.mark.asyncio
 class TestFetchKlinesHelper:
     """Test the standalone fetch_klines helper."""
 
@@ -259,6 +262,7 @@ class TestFetchKlinesHelper:
             client_instance.close.assert_called_once()
 
 
+@pytest.mark.asyncio
 class TestHyperliquidRESTClose:
     """Test client cleanup."""
 
@@ -276,3 +280,57 @@ class TestHyperliquidRESTClose:
         client._session = mock_session
         await client.close()
         mock_session.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+class TestHyperliquidRESTTransportConfig:
+    """Test retry and timeout config plumbing."""
+
+    async def test_post_retries_on_transient_http_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """HTTP 500 should retry until success when configured."""
+        responses = [500, 200]
+
+        class FakeResponse:
+            def __init__(self, status: int) -> None:
+                self.status = status
+
+            async def __aenter__(self) -> Self:
+                return self
+
+            async def __aexit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> None:
+                _ = (exc_type, exc, tb)
+
+            def raise_for_status(self) -> None:
+                if self.status >= 400:
+                    raise aiohttp.ClientResponseError(MagicMock(), (), status=self.status, message="boom")
+
+            async def json(self) -> dict[str, str]:
+                return {"ok": "true"}
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.closed = False
+                self.post_calls = 0
+
+            def post(self, *args: Any, **kwargs: Any) -> FakeResponse:
+                _ = (args, kwargs)
+                self.post_calls += 1
+                return FakeResponse(responses.pop(0))
+
+            async def close(self) -> None:
+                self.closed = True
+
+        client = HyperliquidREST(timeout_seconds=5.0, max_retries=1, retry_base_delay_seconds=0.0)
+        fake_session = FakeSession()
+        client._get_session = AsyncMock(return_value=fake_session)  # type: ignore[method-assign]
+        monkeypatch.setattr("hyperliquid.rest_client._rate_limiter.acquire", AsyncMock())
+
+        data = await client._post({"type": "meta"})
+
+        assert data == {"ok": "true"}
+        assert fake_session.post_calls == 2

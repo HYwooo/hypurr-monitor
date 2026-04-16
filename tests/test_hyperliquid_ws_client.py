@@ -20,8 +20,6 @@ import pytest
 
 from hyperliquid.ws_client import HyperliquidWS
 
-pytestmark = pytest.mark.asyncio
-
 
 class TestHyperliquidWSInit:
     """Test client initialization."""
@@ -67,6 +65,7 @@ class ErrorMsg:
     type = aiohttp.WSMsgType.ERROR
 
 
+@pytest.mark.asyncio
 class TestHyperliquidWSConnect:
     """Test WebSocket connection."""
 
@@ -100,6 +99,7 @@ class TestHyperliquidWSConnect:
         assert mock_ws.send_json.call_count == len(HyperliquidWS.DEXES)
 
 
+@pytest.mark.asyncio
 class TestHyperliquidWSReceiveLoop:
     """Test message receiving and parsing."""
 
@@ -229,6 +229,7 @@ class TestHyperliquidWSReceiveLoop:
         assert ws._marks["BTC"] == 65000.5
 
 
+@pytest.mark.asyncio
 class TestHyperliquidWSGetMarks:
     """Test getting mark prices."""
 
@@ -241,6 +242,7 @@ class TestHyperliquidWSGetMarks:
         assert "ETH" not in ws._marks
 
 
+@pytest.mark.asyncio
 class TestHyperliquidWSClose:
     """Test client cleanup."""
 
@@ -266,6 +268,7 @@ class TestHyperliquidWSClose:
         mock_session.close.assert_called_once()
 
 
+@pytest.mark.asyncio
 class TestGetMarkPricesOnce:
     """Test one-shot mark price fetch helper."""
 

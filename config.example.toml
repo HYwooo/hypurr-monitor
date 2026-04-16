@@ -78,6 +78,27 @@ enable = false # 是否启用代理
 url = "http://127.0.0.1:7890"  # 代理地址
 
 # ------------------------------------------------------------
+# 网络配置
+# timeout / retry 统一入口；proxy 仍复用上面的 [proxy]
+# ------------------------------------------------------------
+[network.rest]
+timeout_seconds = 30
+max_retries = 2
+base_delay_seconds = 1
+
+[network.ws]
+connect_timeout_seconds = 65
+receive_timeout_seconds = 65
+idle_timeout_seconds = 25
+reconnect_base_delay_seconds = 2
+reconnect_max_delay_seconds = 30
+
+[network.webhook]
+timeout_seconds = 10
+max_retries = 2
+base_delay_seconds = 1
+
+# ------------------------------------------------------------
 # 定时报告配置 (备选功能)
 # ------------------------------------------------------------
 [report]
