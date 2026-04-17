@@ -125,6 +125,7 @@ class TestWSRuntimeSupervisor:
             send_ping_fn=send_ping,
             reconnect_fn=reconnect,
             mark_message_received_fn=mark_message_received,
+            enqueue_payload_fn=MagicMock(),
             process_payload_fn=process_payload,
         )
 
@@ -152,6 +153,7 @@ class TestWSRuntimeSupervisor:
             send_ping_fn=send_ping,
             reconnect_fn=reconnect,
             mark_message_received_fn=mark_message_received,
+            enqueue_payload_fn=MagicMock(),
             process_payload_fn=process_payload,
         )
 

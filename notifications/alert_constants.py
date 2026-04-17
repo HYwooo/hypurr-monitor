@@ -9,6 +9,8 @@ ALERT_CONFIG = "CONFIG"
 ALERT_CONFIG_ERROR = "CONFIG ERROR"
 ALERT_REPORT = "REPORT"
 
+RECONNECT_ELAPSED_NOTIFY_THRESHOLD_SECONDS = 5.0
+
 DIRECTION_LONG = "LONG"
 DIRECTION_SHORT = "SHORT"
 
@@ -52,8 +54,10 @@ def format_ws_reconnect_failure_message(reason: str) -> str:
     return f"Hyperliquid WS disconnected: {reason}. Reconnecting..."
 
 
-def format_ws_reconnect_success_message(reason: str, attempt: int) -> str:
+def format_ws_reconnect_success_message(reason: str, attempt: int, elapsed_seconds: float = 0.0) -> str:
     """Format websocket reconnect success message."""
+    if elapsed_seconds > RECONNECT_ELAPSED_NOTIFY_THRESHOLD_SECONDS:
+        return f"Hyperliquid WS reconnected after {reason} (attempt {attempt}, {elapsed_seconds:.1f}s)"
     return f"Hyperliquid WS reconnected after {reason} (attempt {attempt})"
 
 

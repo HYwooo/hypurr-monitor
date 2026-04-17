@@ -35,6 +35,7 @@ from notifications import (
     ALERT_SYSTEM,
     DIRECTION_LONG,
     DIRECTION_SHORT,
+    RECONNECT_ELAPSED_NOTIFY_THRESHOLD_SECONDS,
     AlertEvent,
     WebhookSender,
     format_connection_failed_message,
@@ -71,6 +72,7 @@ ATR_BREAKOUT_COOLDOWN_SECONDS = 3600
 HEARTBEAT_WRITE_THROTTLE_SECONDS = 5
 BREAKOUT_DIRECTION_LONG = "11"
 BREAKOUT_DIRECTION_SHORT = "00"
+RECONNECT_MIN_ATTEMPT_NOTIFY = 2
 
 
 def build_pair_15m_klines(symbol: str, klines1: list[Kline], klines2: list[Kline]) -> list[Kline]:
@@ -345,6 +347,7 @@ class NotificationService:
             send_ping_fn=lambda: self._send_hyperliquid_ping(),
             reconnect_fn=lambda reason: self._reconnect_hyperliquid_ws(reason),
             mark_message_received_fn=lambda now: self._record_ws_message(now),
+            enqueue_payload_fn=lambda data: self._enqueue_ws_payload(data),
             process_payload_fn=lambda data: self._market_data_processor.process_payload(data),
         )
 
@@ -368,6 +371,10 @@ class NotificationService:
     def _record_ws_message(self, now: float) -> None:
         """Record receipt of any websocket message for observability."""
         self._last_ws_message_time = now
+
+    def _enqueue_ws_payload(self, data: dict[str, Any]) -> None:
+        """Enqueue a parsed WS payload into the signal-processing queue."""
+        self._ws_runtime_supervisor.enqueue_payload(data)
 
     async def _receive_hyperliquid_ws_message(self) -> aiohttp.WSMessage:
         """Receive next websocket message from the active Hyperliquid stream."""
@@ -861,38 +868,50 @@ class NotificationService:
             raise ConnectionError("ws unavailable")  # noqa: TRY003
         await self.market_gateway.send_ws_ping(self._hl_ws)
 
-    async def _notify_ws_reconnect_failure(self, reason: str) -> None:
-        """Send a single webhook when websocket enters reconnect mode."""
+    async def _notify_ws_reconnect_failure(self, reason: str, attempt: int) -> None:
+        """Send a single webhook when websocket enters reconnect mode (attempt >= 2 only)."""
+        if attempt < RECONNECT_MIN_ATTEMPT_NOTIFY:
+            return
         if self._ws_reconnect_alert_active:
             return
         self._ws_reconnect_alert_active = True
         with suppress(Exception):
             await self._send_webhook(ALERT_ERROR, format_ws_reconnect_failure_message(reason))
 
-    async def _notify_ws_reconnect_success(self, reason: str, attempt: int) -> None:
-        """Send webhook when websocket recovers from reconnect mode."""
+    async def _notify_ws_reconnect_success(self, reason: str, attempt: int, elapsed_seconds: float) -> None:
+        """Send webhook when websocket recovers (attempt >= 2 or elapsed > 5s only)."""
         if not self._ws_reconnect_alert_active:
+            return
+        if attempt < RECONNECT_MIN_ATTEMPT_NOTIFY and elapsed_seconds <= RECONNECT_ELAPSED_NOTIFY_THRESHOLD_SECONDS:
+            self._ws_reconnect_alert_active = False
             return
         self._ws_reconnect_alert_active = False
         with suppress(Exception):
-            await self._send_webhook(ALERT_SYSTEM, format_ws_reconnect_success_message(reason, attempt))
+            await self._send_webhook(
+                ALERT_SYSTEM,
+                format_ws_reconnect_success_message(reason, attempt, elapsed_seconds),
+            )
 
     async def _reconnect_hyperliquid_ws(self, reason: str) -> bool:
         """Reconnect Hyperliquid websocket with exponential backoff."""
         self.connected = False
         delay = self.network.ws.reconnect_base_delay_seconds
         attempt = 0
+        started_at = time.time()
 
         while self._hl_ws_running:
             attempt += 1
-            await self._notify_ws_reconnect_failure(reason)
-            logger.warning("Hyperliquid WS reconnecting (%s), attempt %s", reason, attempt)
+            elapsed = time.time() - started_at
+            await self._notify_ws_reconnect_failure(reason, attempt)
+            if attempt == 1 and elapsed <= RECONNECT_ELAPSED_NOTIFY_THRESHOLD_SECONDS:
+                logger.info("Hyperliquid WS reconnected instantly (%s, attempt %s, %.1fs)", reason, attempt, elapsed)
+            else:
+                logger.warning("Hyperliquid WS reconnecting (%s), attempt %s", reason, attempt)
             try:
                 await self._close_hyperliquid_ws()
                 await self._connect_hyperliquid_ws(start_watch_task=False)
                 self.connected = True
-                await self._notify_ws_reconnect_success(reason, attempt)
-                logger.info("Hyperliquid WS reconnected after %s, attempt %s", reason, attempt)
+                await self._notify_ws_reconnect_success(reason, attempt, elapsed)
                 return True
             except Exception as e:
                 logger.warning("Hyperliquid WS reconnect failed on attempt %s: %s", attempt, e)
