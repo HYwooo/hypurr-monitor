@@ -13,7 +13,6 @@ Responsibilities:
 import logging
 import math
 import time
-from contextlib import suppress
 from typing import Any
 
 import numpy as np
@@ -33,8 +32,16 @@ from notifications import (
     REASON_TRAILING_STOP,
     emit_alert,
     format_directional_signal_message,
-    format_number,
     format_trailing_stop_message,
+)
+from signals.state import (
+    TrailingStopState,
+    get_atr_channel_state,
+    get_clustering_signal_state,
+    get_trailing_stop_state,
+    set_atr_channel_state,
+    set_clustering_signal_state,
+    set_trailing_stop_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -277,7 +284,7 @@ async def recalculate_states(  # noqa: PLR0913
     klines = kline_cache.get(symbol, [])
     if len(klines) < MIN_KLINES:
         return
-    with suppress(Exception):
+    try:
         close = np.array([float(k.close) for k in klines], dtype=float)
         high = np.array([float(k.high) for k in klines], dtype=float)
         low = np.array([float(k.low) for k in klines], dtype=float)
@@ -340,6 +347,8 @@ async def recalculate_states(  # noqa: PLR0913
             "atr1h_raw": float(atr1h[-1]) if math.isfinite(atr1h[-1]) else 0,
             "atr1h_natrr": float(atr1h_natrr[-1]) if math.isfinite(atr1h_natrr[-1]) else 0,
         }
+    except Exception as exc:
+        logger.warning("[recalculate_states] symbol=%s stage=indicator_batch reason=%s", symbol, exc, exc_info=True)
 
 
 async def check_signals(  # noqa: PLR0913
@@ -368,7 +377,7 @@ async def check_signals(  # noqa: PLR0913
     """
     if symbol not in benchmark:
         return
-    with suppress(Exception):
+    try:
         await check_signals_impl(
             symbol,
             mark_prices,
@@ -389,6 +398,8 @@ async def check_signals(  # noqa: PLR0913
             increment_alert_count_fn,
             send_event_fn,
         )
+    except Exception as exc:
+        logger.warning("[check_signals] symbol=%s stage=wrapper reason=%s", symbol, exc, exc_info=True)
 
 
 async def check_signals_impl(  # noqa: PLR0913
@@ -443,13 +454,13 @@ async def check_signals_impl(  # noqa: PLR0913
     atr1h_upper = bm.get("atr1h_upper", 0)
     atr1h_lower = bm.get("atr1h_lower", 0)
     atr1h_natrr = bm.get("atr1h_natrr", 0)
-    prev_atr_state = last_atr_state.get(symbol, {"ch": 0, "sent": None})
+    prev_atr_state = get_atr_channel_state(last_atr_state, symbol)
 
-    if price_ge(current_price, atr1h_upper) and prev_atr_state["ch"] != 1:
+    if price_ge(current_price, atr1h_upper) and prev_atr_state.ch != 1:
         last_alert = last_alert_time.get(f"ATR_Ch_{symbol}", 0)
         if now - last_alert > SIGNAL_COOLDOWN:
             last_alert_time[f"ATR_Ch_{symbol}"] = now
-            last_atr_state[symbol] = {"ch": 1, "sent": "LONG"}
+            set_atr_channel_state(last_atr_state, symbol, 1, "LONG")
             natr = (atr1h_natrr / current_price * 100) if current_price > 0 and atr1h_natrr > 0 else None
             await emit_alert(
                 send_webhook_fn,
@@ -458,30 +469,30 @@ async def check_signals_impl(  # noqa: PLR0913
                 {
                     "symbol": symbol,
                     "direction": DIRECTION_LONG,
-                    "price": format_number(current_price),
-                    "atr_upper": format_number(atr1h_upper),
-                    "atr_lower": format_number(atr1h_lower),
+                    "price": current_price,
+                    "atr_upper": atr1h_upper,
+                    "atr_lower": atr1h_lower,
                     "natr": natr,
                 },
                 send_event_fn,
             )
             increment_alert_count_fn()
-            trailing_stop[symbol] = {
-                "direction": DIRECTION_LONG,
-                "entry_price": current_price,
-                "entry_time": now,
-                "atr_mult": atr15m_mult,
-                "atr15m_upper": 0,
-                "atr15m_lower": 0,
-                "atr15m_state": (float("nan"), float("nan"), 0),
-                "active": True,
-            }
+            set_trailing_stop_state(
+                trailing_stop,
+                symbol,
+                TrailingStopState(
+                direction=DIRECTION_LONG,
+                entry_price=current_price,
+                entry_time=now,
+                atr_mult=atr15m_mult,
+                ),
+            )
 
-    elif price_le(current_price, atr1h_lower) and prev_atr_state["ch"] != -1:
+    elif price_le(current_price, atr1h_lower) and prev_atr_state.ch != -1:
         last_alert = last_alert_time.get(f"ATR_Ch_{symbol}", 0)
         if now - last_alert > SIGNAL_COOLDOWN:
             last_alert_time[f"ATR_Ch_{symbol}"] = now
-            last_atr_state[symbol] = {"ch": -1, "sent": "SHORT"}
+            set_atr_channel_state(last_atr_state, symbol, -1, "SHORT")
             natr = (atr1h_natrr / current_price * 100) if current_price > 0 and atr1h_natrr > 0 else None
             await emit_alert(
                 send_webhook_fn,
@@ -490,27 +501,27 @@ async def check_signals_impl(  # noqa: PLR0913
                 {
                     "symbol": symbol,
                     "direction": DIRECTION_SHORT,
-                    "price": format_number(current_price),
-                    "atr_upper": format_number(atr1h_upper),
-                    "atr_lower": format_number(atr1h_lower),
+                    "price": current_price,
+                    "atr_upper": atr1h_upper,
+                    "atr_lower": atr1h_lower,
                     "natr": natr,
                 },
                 send_event_fn,
             )
             increment_alert_count_fn()
-            trailing_stop[symbol] = {
-                "direction": DIRECTION_SHORT,
-                "entry_price": current_price,
-                "entry_time": now,
-                "atr_mult": atr15m_mult,
-                "atr15m_upper": 0,
-                "atr15m_lower": 0,
-                "atr15m_state": (float("nan"), float("nan"), 0),
-                "active": True,
-            }
+            set_trailing_stop_state(
+                trailing_stop,
+                symbol,
+                TrailingStopState(
+                direction=DIRECTION_SHORT,
+                entry_price=current_price,
+                entry_time=now,
+                atr_mult=atr15m_mult,
+                ),
+            )
 
 
-async def check_trailing_stop(  # noqa: PLR0913, PLR0912
+async def check_trailing_stop(  # noqa: PLR0913
     symbol: str,
     current_price: float,
     trailing_stop: dict[str, Any],
@@ -539,16 +550,25 @@ async def check_trailing_stop(  # noqa: PLR0913, PLR0912
     """
     if current_price <= 0:
         return
-    if symbol not in trailing_stop:
-        return
-    ts_entry = trailing_stop.get(symbol)
-    if not ts_entry.get("active"):  # type: ignore[union-attr]
-        return
-    with suppress(Exception):
-        direction = ts_entry.get("direction", "")  # type: ignore[union-attr]
+    try:
+        ts_entry = get_trailing_stop_state(trailing_stop, symbol)
+        if ts_entry is None:
+            return
+        normalized = ts_entry
+        if not normalized.active:
+            return
+        direction = normalized.direction
+        use_clustering_ts = normalized.use_clustering_ts
+        clustering_ts_val = normalized.clustering_ts
+        upper = normalized.atr15m_upper
+        lower = normalized.atr15m_lower
+        entry_price = normalized.entry_price
 
-        if ts_entry.get("use_clustering_ts"):  # type: ignore[union-attr]
-            clustering_ts_val = ts_entry.get("clustering_ts", 0)  # type: ignore[union-attr]
+        def deactivate() -> None:
+            """Deactivate the trailing stop state."""
+            normalized.active = False
+
+        if use_clustering_ts:
             if clustering_ts_val > 0:
                 if direction == DIRECTION_LONG and price_lt(current_price, clustering_ts_val):
                     await emit_alert(
@@ -558,19 +578,16 @@ async def check_trailing_stop(  # noqa: PLR0913, PLR0912
                         {
                             "symbol": symbol,
                             "direction": DIRECTION_LONG,
-                            "price": format_number(current_price),
-                            "stop_line": format_number(clustering_ts_val),
-                            "entry_price": format_number(
-                                ts_entry.get("entry_price", 0)  # type: ignore[union-attr]
-                            ),
+                            "price": current_price,
+                            "stop_line": clustering_ts_val,
+                            "entry_price": entry_price,
                             "reason": REASON_TRAILING_STOP,
                         },
                         send_event_fn,
                     )
                     increment_alert_count_fn()
-                    ts_entry["active"] = False  # type: ignore[index]
-                    if last_alert_time is not None:
-                        last_alert_time[symbol] = 0
+                    deactivate()
+                    _clear_trailing_stop_cooldown(last_alert_time, symbol, "clustering_ts")
                 elif direction == DIRECTION_SHORT and price_gt(current_price, clustering_ts_val):
                     await emit_alert(
                         send_webhook_fn,
@@ -579,23 +596,17 @@ async def check_trailing_stop(  # noqa: PLR0913, PLR0912
                         {
                             "symbol": symbol,
                             "direction": DIRECTION_SHORT,
-                            "price": format_number(current_price),
-                            "stop_line": format_number(clustering_ts_val),
-                            "entry_price": format_number(
-                                ts_entry.get("entry_price", 0)  # type: ignore[union-attr]
-                            ),
+                            "price": current_price,
+                            "stop_line": clustering_ts_val,
+                            "entry_price": entry_price,
                             "reason": REASON_TRAILING_STOP,
                         },
                         send_event_fn,
                     )
                     increment_alert_count_fn()
-                    ts_entry["active"] = False  # type: ignore[index]
-                    if last_alert_time is not None:
-                        last_alert_time[symbol] = 0
+                    deactivate()
+                    _clear_trailing_stop_cooldown(last_alert_time, symbol, "clustering_ts")
             return
-
-        upper = ts_entry.get("atr15m_upper", 0)  # type: ignore[union-attr]
-        lower = ts_entry.get("atr15m_lower", 0)  # type: ignore[union-attr]
 
         if direction == DIRECTION_LONG and lower > 0 and price_lt(current_price, lower):
             await emit_alert(
@@ -605,17 +616,16 @@ async def check_trailing_stop(  # noqa: PLR0913, PLR0912
                 {
                     "symbol": symbol,
                     "direction": DIRECTION_LONG,
-                    "price": format_number(current_price),
-                    "stop_line": format_number(lower),
-                    "entry_price": format_number(ts_entry.get("entry_price", 0)),  # type: ignore[union-attr]
+                    "price": current_price,
+                    "stop_line": lower,
+                    "entry_price": entry_price,
                     "reason": REASON_TRAILING_STOP,
                 },
                 send_event_fn,
             )
             increment_alert_count_fn()
-            ts_entry["active"] = False  # type: ignore[index]
-            if last_alert_time is not None:
-                last_alert_time[symbol] = 0
+            deactivate()
+            _clear_trailing_stop_cooldown(last_alert_time, symbol, "atr15m_lower")
 
         elif direction == DIRECTION_SHORT and upper > 0 and price_gt(current_price, upper):
             await emit_alert(
@@ -625,17 +635,28 @@ async def check_trailing_stop(  # noqa: PLR0913, PLR0912
                 {
                     "symbol": symbol,
                     "direction": DIRECTION_SHORT,
-                    "price": format_number(current_price),
-                    "stop_line": format_number(upper),
-                    "entry_price": format_number(ts_entry.get("entry_price", 0)),  # type: ignore[union-attr]
+                    "price": current_price,
+                    "stop_line": upper,
+                    "entry_price": entry_price,
                     "reason": REASON_TRAILING_STOP,
                 },
                 send_event_fn,
             )
             increment_alert_count_fn()
-            ts_entry["active"] = False  # type: ignore[index]
-            if last_alert_time is not None:
-                last_alert_time[symbol] = 0
+            deactivate()
+            _clear_trailing_stop_cooldown(last_alert_time, symbol, "atr15m_upper")
+
+    except Exception as exc:
+        logger.warning("[check_trailing_stop] symbol=%s stage=trailing_stop reason=%s", symbol, exc, exc_info=True)
+
+
+def _clear_trailing_stop_cooldown(last_alert_time: dict[str, Any] | None, symbol: str, source: str) -> None:
+    """Clear the cooldown key associated with a trailing-stop source."""
+    if last_alert_time is None:
+        return
+    cooldown_key = f"ATR_Ch_{symbol}" if source in {"atr15m_lower", "atr15m_upper"} else f"ClusterST_{symbol}"
+    # Design note: clear only the cooldown key owned by this stop source.
+    last_alert_time[cooldown_key] = 0
 
 
 async def recalculate_states_clustering(  # noqa: PLR0913
@@ -685,7 +706,7 @@ async def recalculate_states_clustering(  # noqa: PLR0913
     klines = kline_cache.get(symbol, [])
     if len(klines) < MIN_KLINES:
         return
-    with suppress(Exception):
+    try:
         close = np.array([float(k.close) for k in klines], dtype=float)
         if is_pair_trading:
             open_arr = np.array([float(k.open) for k in klines], dtype=float)
@@ -765,6 +786,8 @@ async def recalculate_states_clustering(  # noqa: PLR0913
             "perf_ama": float(perf_ama) if math.isfinite(perf_ama) else 0,
             "target_factor": new_state.target_factor,
         }
+    except Exception as exc:
+        logger.warning("[recalculate_states_clustering] symbol=%s stage=indicator_batch reason=%s", symbol, exc, exc_info=True)
 
 
 async def check_signals_clustering(  # noqa: PLR0913
@@ -800,7 +823,7 @@ async def check_signals_clustering(  # noqa: PLR0913
     """
     if symbol not in benchmark:
         return
-    with suppress(Exception):
+    try:
         await check_signals_clustering_impl(
             symbol,
             mark_prices,
@@ -828,6 +851,8 @@ async def check_signals_clustering(  # noqa: PLR0913
             increment_alert_count_fn,
             send_event_fn,
         )
+    except Exception as exc:
+        logger.warning("[check_signals_clustering] %s failed: %s", symbol, exc)
 
 
 async def check_signals_clustering_impl(  # noqa: PLR0913
@@ -878,7 +903,8 @@ async def check_signals_clustering_impl(  # noqa: PLR0913
     if not bm:
         return
 
-    prev_trend = last_clustering_state.get(symbol, {}).get("trend", 0)
+    prev_state = get_clustering_signal_state(last_clustering_state, symbol)
+    prev_trend = int(prev_state.trend)
     target_factor = bm.get("target_factor", (clustering_min_mult + clustering_max_mult) / 2)
     ts = bm.get("ts", 0)
     perf_ama = bm.get("perf_ama", 0)
@@ -899,7 +925,7 @@ async def check_signals_clustering_impl(  # noqa: PLR0913
         if now - last_alert > SIGNAL_COOLDOWN:
             last_alert_time[f"ClusterST_{symbol}"] = now
             direction = DIRECTION_LONG if current_trend == 1 else DIRECTION_SHORT
-            last_clustering_state[symbol] = {"trend": current_trend, "sent": direction}
+            set_clustering_signal_state(last_clustering_state, symbol, current_trend, direction)
             await emit_alert(
                 send_webhook_fn,
                 ALERT_CLUSTER_ST,
@@ -907,31 +933,32 @@ async def check_signals_clustering_impl(  # noqa: PLR0913
                 {
                     "symbol": symbol,
                     "direction": direction,
-                    "price": format_number(current_price),
-                    "ts": format_number(ts),
-                    "perf_ama": format_number(perf_ama),
-                    "target_factor": format_number(target_factor),
+                    "price": current_price,
+                    "ts": ts,
+                    "perf_ama": perf_ama,
+                    "target_factor": target_factor,
                 },
                 send_event_fn,
             )
             increment_alert_count_fn()
-            trailing_stop[symbol] = {
-                "direction": direction,
-                "entry_price": current_price,
-                "entry_time": now,
-                "atr_mult": atr15m_mult,
-                "atr15m_upper": 0,
-                "atr15m_lower": 0,
-                "atr15m_state": (float("nan"), float("nan"), 0),
-                "active": True,
-                "use_clustering_ts": True,
-                "clustering_ts": ts,
-            }
+            set_trailing_stop_state(
+                trailing_stop,
+                symbol,
+                TrailingStopState(
+                direction=direction,
+                entry_price=current_price,
+                entry_time=now,
+                atr_mult=atr15m_mult,
+                use_clustering_ts=True,
+                clustering_ts=ts,
+                ),
+            )
     else:
-        prev_sent = last_clustering_state.get(symbol, {}).get("sent")
+        prev_sent = prev_state.sent
         if prev_sent is None:
             prev_sent = "N/A"
-        last_clustering_state[symbol] = {"trend": current_trend, "sent": prev_sent}
+        set_clustering_signal_state(last_clustering_state, symbol, current_trend, prev_sent)
 
-    if symbol in trailing_stop and trailing_stop[symbol].get("use_clustering_ts"):
-        trailing_stop[symbol]["clustering_ts"] = ts
+    ts_entry = get_trailing_stop_state(trailing_stop, symbol)
+    if ts_entry and ts_entry.use_clustering_ts:
+        ts_entry.clustering_ts = ts

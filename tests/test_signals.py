@@ -18,6 +18,7 @@ from service.notification_service import (
     aggregate_pair_15m_to_4h,
     build_pair_15m_klines,
 )
+from signals.breakout import check_breakout
 from signals.detection import (
     PRECISION_EPSILON,
     check_signals,
@@ -29,6 +30,7 @@ from signals.detection import (
     recalculate_states,
     update_klines,
 )
+from signals.state import BreakoutMonitorState, TrailingStopState
 
 
 class TestPriceComparisons:
@@ -380,8 +382,61 @@ class TestCheckSignals:
             mock_increment,
         )
         assert "BTC" in trailing_stop
-        assert trailing_stop["BTC"]["direction"] == "LONG"
-        assert trailing_stop["BTC"]["active"] is True
+        assert isinstance(trailing_stop["BTC"], TrailingStopState)
+        assert trailing_stop["BTC"].direction == "LONG"
+        assert trailing_stop["BTC"].active is True
+
+    @pytest.mark.asyncio
+    async def test_legacy_trailing_stop_state_is_normalized(self, mock_webhook: AsyncMock, mock_increment: MagicMock) -> None:
+        """Legacy dict trailing stop entries should be normalized in-place."""
+        trailing_stop: dict[str, Any] = {
+            "BTC": {
+                "direction": "LONG",
+                "entry_price": 48000.0,
+                "entry_time": time.time(),
+                "atr_mult": 1.3,
+                "atr15m_lower": 49000.0,
+                "atr15m_upper": 51000.0,
+                "active": True,
+            }
+        }
+        last_alert_time: dict[str, Any] = {}
+
+        await check_trailing_stop(
+            "BTC",
+            47000.0,
+            trailing_stop,
+            mock_webhook,
+            mock_increment,
+            last_alert_time,
+        )
+
+        assert isinstance(trailing_stop["BTC"], TrailingStopState)
+        assert trailing_stop["BTC"].active is False
+
+    @pytest.mark.asyncio
+    async def test_legacy_breakout_monitor_state_is_normalized(self, mock_webhook: AsyncMock, mock_increment: MagicMock) -> None:
+        """Legacy breakout monitor dicts should be normalized in-place."""
+        breakout_monitor: dict[str, Any] = {
+            "BTC": {
+                "direction": "11",
+                "trigger_price": 50000.0,
+                "trigger_time": time.time(),
+                "kline_15m_count": 1,
+                "klines_15m": [Kline("BTC", "15m", 0, 1, 2, 0.5, 1.5, 1, 1, True), Kline("BTC", "15m", 1, 1, 2, 0.5, 1.6, 1, 2, True)],
+            }
+        }
+
+        await check_breakout("BTC", breakout_monitor, mock_webhook, mock_increment)
+
+        assert isinstance(breakout_monitor["BTC"], BreakoutMonitorState)
+
+    def test_state_normalizers_accept_legacy_dicts(self) -> None:
+        """State helper functions should preserve legacy payload compatibility."""
+        trailing = TrailingStopState(direction="LONG", entry_price=1.0, entry_time=2.0, atr_mult=3.0)
+        breakout = BreakoutMonitorState(direction="11", trigger_price=1.0, trigger_time=2.0)
+        assert trailing.to_legacy_dict()["direction"] == "LONG"
+        assert breakout.to_legacy_dict()["direction"] == "11"
 
 
 class TestPairATRKlines:
@@ -535,6 +590,20 @@ class TestNotificationServiceATRMode:
         assert f"ATR_4H_{symbol}" not in service.last_alert_time
         assert f"ClusterST_{symbol}" not in service.last_alert_time
         assert symbol not in service.trailing_stop
+
+    def test_runtime_state_aliases_remain_compatible(self, tmp_path: Any) -> None:
+        """Legacy attribute access should still point at the shared runtime state."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+
+        assert service.runtime_state.mark_prices is service.mark_prices
+        assert service.runtime_state.mark_price_times is service.mark_price_times
+        assert service.runtime_state.benchmark is service.benchmark
+        assert service.runtime_state.trailing_stop is service.trailing_stop
+        assert service.runtime_state.breakout_monitor is service.breakout_monitor
+        assert service.runtime_state.last_alert_time is service.last_alert_time
+        assert service.runtime_state.last_atr_state is service.last_atr_state
+        assert service.runtime_state.last_atr4h_state is service.last_atr4h_state
+        assert service.runtime_state.last_clustering_state is service.last_clustering_state
 
     def test_prune_runtime_state_keeps_active_pair_components(self, tmp_path: Any) -> None:
         """Prune should keep active pair legs while removing stale symbols."""
@@ -1005,6 +1074,207 @@ class TestNotificationServiceATRMode:
 
         assert "AAA-BBB" in service.breakout_monitor
 
+    @pytest.mark.asyncio
+    async def test_ct_start_breakout_monitor_does_not_pollute_mark_prices(self, tmp_path: Any) -> None:
+        """Breakout start should not write fake component prices into runtime cache."""
+        service = NotificationService(self._write_config(tmp_path, clustering_enabled=False))
+
+        async def fake_pair_fetch(
+            symbol: str,
+            limit: int = 500,
+            interval: str = "1h",
+            proxy: str | None = None,
+            kline_cache: dict[str, Any] | None = None,
+            _fetch_klines_fn: Any = None,
+        ) -> list[Kline]:
+            _ = (symbol, limit, interval, proxy, kline_cache, _fetch_klines_fn)
+            now = int(time.time() * 1000)
+            return [
+                Kline(symbol="AAA-BBB", interval="15m", open_time=now + i, open=1.0, high=1.1, low=0.9, close=1.0, volume=1.0)
+                for i in range(20)
+            ]
+
+        service._hl_fetch_pair_klines = fake_pair_fetch  # type: ignore[method-assign]
+        service.mark_prices["AAA"] = 2.0
+        service.mark_prices["BBB"] = 1.0
+
+        await service._ct_start_breakout_monitor("AAA-BBB", "11", 1.0, 123.0)
+
+        assert service.mark_prices["AAA"] == 2.0
+        assert service.mark_prices["BBB"] == 1.0
+        assert "AAA-BBB" not in service.mark_prices
+
+
+class TestBreakoutCloseBasedConfirmation:
+    """Test close-based breakout confirmation and reversal rules."""
+
+    @pytest.fixture
+    def breakout_monitor(self) -> dict[str, Any]:
+        """Create a breakout monitor state container."""
+        return {}
+
+    def _build_klines(self, closes: list[float], highs: list[float] | None = None) -> list[Kline]:
+        """Build 15m klines with controlled close and high values."""
+        highs = highs or closes
+        return [
+            Kline(symbol="BTC", interval="15m", open_time=i, open=close, high=highs[i], low=close, close=close, volume=1.0)
+            for i, close in enumerate(closes)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_long_confirmed_when_latest_close_breaks_highest_previous(self, breakout_monitor: dict[str, Any]) -> None:
+        """LONG should confirm only when latest close exceeds previous closes."""
+        symbol = "BTC"
+        breakout_monitor[symbol] = {
+            "direction": "11",
+            "trigger_price": 100.0,
+            "kline_15m_count": 1,
+            "klines_15m": self._build_klines([100.0, 101.0, 102.0]),
+        }
+        stop_monitor = AsyncMock()
+        send_event = AsyncMock()
+
+        await check_breakout(symbol, breakout_monitor, AsyncMock(), MagicMock(), stop_monitor, send_event)
+
+        send_event.assert_awaited_once()
+        assert send_event.await_args is not None
+        event = send_event.await_args.args[0]
+        assert event.direction == "LONG"
+        assert event.extra["confirmed"] is True
+        assert float(event.extra["price"]) == 102.0
+        stop_monitor.assert_awaited_once_with(symbol)
+
+    @pytest.mark.asyncio
+    async def test_long_reverse_when_latest_close_breaks_lowest_previous(self, breakout_monitor: dict[str, Any]) -> None:
+        """LONG should reverse only when latest close falls below previous closes."""
+        symbol = "BTC"
+        breakout_monitor[symbol] = {
+            "direction": "11",
+            "trigger_price": 100.0,
+            "kline_15m_count": 1,
+            "klines_15m": self._build_klines([102.0, 101.0, 99.0]),
+        }
+        send_event = AsyncMock()
+
+        await check_breakout(symbol, breakout_monitor, AsyncMock(), MagicMock(), send_event_fn=send_event)
+
+        assert send_event.await_args is not None
+        event = send_event.await_args.args[0]
+        assert event.direction == "LONG"
+        assert event.extra["confirmed"] is False
+        assert event.extra["reason"] == "reverse"
+
+    @pytest.mark.asyncio
+    async def test_long_no_continuation_after_20_bars(self, breakout_monitor: dict[str, Any]) -> None:
+        """LONG should expire after 20 bars without confirmation."""
+        symbol = "BTC"
+        breakout_monitor[symbol] = {
+            "direction": "11",
+            "trigger_price": 100.0,
+            "kline_15m_count": 20,
+            "klines_15m": self._build_klines([100.0, 101.0, 100.5]),
+        }
+        send_event = AsyncMock()
+
+        await check_breakout(symbol, breakout_monitor, AsyncMock(), MagicMock(), send_event_fn=send_event)
+
+        assert send_event.await_args is not None
+        event = send_event.await_args.args[0]
+        assert event.direction == "LONG"
+        assert event.extra["confirmed"] is False
+        assert event.extra["reason"] == "no_continuation"
+
+    @pytest.mark.asyncio
+    async def test_short_confirmed_when_latest_close_breaks_lowest_previous(self, breakout_monitor: dict[str, Any]) -> None:
+        """SHORT should confirm only when latest close falls below previous closes."""
+        symbol = "BTC"
+        breakout_monitor[symbol] = {
+            "direction": "00",
+            "trigger_price": 100.0,
+            "kline_15m_count": 1,
+            "klines_15m": self._build_klines([102.0, 101.0, 99.0]),
+        }
+        send_event = AsyncMock()
+
+        await check_breakout(symbol, breakout_monitor, AsyncMock(), MagicMock(), send_event_fn=send_event)
+
+        assert send_event.await_args is not None
+        event = send_event.await_args.args[0]
+        assert event.direction == "SHORT"
+        assert event.extra["confirmed"] is True
+
+    @pytest.mark.asyncio
+    async def test_short_reverse_when_latest_close_breaks_highest_previous(self, breakout_monitor: dict[str, Any]) -> None:
+        """SHORT should reverse only when latest close rises above previous closes."""
+        symbol = "BTC"
+        breakout_monitor[symbol] = {
+            "direction": "00",
+            "trigger_price": 100.0,
+            "kline_15m_count": 1,
+            "klines_15m": self._build_klines([98.0, 99.0, 101.0]),
+        }
+        send_event = AsyncMock()
+
+        await check_breakout(symbol, breakout_monitor, AsyncMock(), MagicMock(), send_event_fn=send_event)
+
+        assert send_event.await_args is not None
+        event = send_event.await_args.args[0]
+        assert event.direction == "SHORT"
+        assert event.extra["confirmed"] is False
+        assert event.extra["reason"] == "reverse"
+
+    @pytest.mark.asyncio
+    async def test_short_no_continuation_after_20_bars(self, breakout_monitor: dict[str, Any]) -> None:
+        """SHORT should expire after 20 bars without confirmation."""
+        symbol = "BTC"
+        breakout_monitor[symbol] = {
+            "direction": "00",
+            "trigger_price": 100.0,
+            "kline_15m_count": 20,
+            "klines_15m": self._build_klines([100.0, 99.5, 100.0]),
+        }
+        send_event = AsyncMock()
+
+        await check_breakout(symbol, breakout_monitor, AsyncMock(), MagicMock(), send_event_fn=send_event)
+
+        assert send_event.await_args is not None
+        event = send_event.await_args.args[0]
+        assert event.direction == "SHORT"
+        assert event.extra["confirmed"] is False
+        assert event.extra["reason"] == "no_continuation"
+
+    @pytest.mark.asyncio
+    async def test_breakout_uses_close_not_high_for_confirmation(self, breakout_monitor: dict[str, Any]) -> None:
+        """Confirmation should depend on close, not candle high."""
+        symbol = "BTC"
+        breakout_monitor[symbol] = {
+            "direction": "11",
+            "trigger_price": 100.0,
+            "kline_15m_count": 20,
+            "klines_15m": self._build_klines([100.0, 100.5, 100.2], highs=[100.0, 100.5, 999.0]),
+        }
+        send_event = AsyncMock()
+
+        await check_breakout(symbol, breakout_monitor, AsyncMock(), MagicMock(), send_event_fn=send_event)
+
+        assert send_event.await_args is not None
+        event = send_event.await_args.args[0]
+        assert event.extra["confirmed"] is False
+
+    @pytest.mark.asyncio
+    async def test_breakout_logs_exception(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Breakout exception path should emit contextual exception log."""
+        class BadMonitor(dict[str, Any]):
+            def get(self, *_args: Any, **_kwargs: Any) -> Any:
+                raise RuntimeError("boom")
+
+        breakout_monitor: dict[str, Any] = {"BTC": BadMonitor({"direction": "11"})}
+        caplog.set_level("ERROR")
+
+        await check_breakout("BTC", breakout_monitor, AsyncMock(), MagicMock())
+
+        assert "[check_breakout]" in caplog.text
+
 
 class TestCheckTrailingStop:
     """Test trailing stop logic."""
@@ -1025,6 +1295,20 @@ class TestCheckTrailingStop:
         trailing_stop: dict[str, Any] = {"BTC": {"direction": "LONG", "active": False}}
         await check_trailing_stop("BTC", 50000.0, trailing_stop, mock_webhook, mock_increment)
         mock_webhook.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_trailing_stop_logs_exception(self, mock_increment: MagicMock, caplog: pytest.LogCaptureFixture) -> None:
+        """Trailing stop exception path should emit contextual warning."""
+        class BoomDict(dict[str, Any]):
+            def get(self, *_args: Any, **_kwargs: Any) -> Any:
+                raise RuntimeError("boom")
+
+        trailing_stop: dict[str, Any] = {"BTC": BoomDict({"direction": "LONG", "active": True})}
+        caplog.set_level("WARNING")
+
+        await check_trailing_stop("BTC", 49000.0, trailing_stop, AsyncMock(), mock_increment)
+
+        assert "[check_trailing_stop]" in caplog.text
 
     @pytest.mark.asyncio
     async def test_long_stop_triggered(self, mock_webhook: AsyncMock, mock_increment: MagicMock) -> None:

@@ -43,8 +43,8 @@ class WebhookSender:
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
 
-    async def send_json(self, webhook_url: str, payload: dict[str, Any]) -> None:
-        """Send webhook payload with retry on transient transport failures."""
+    async def send_json(self, webhook_url: str, payload: dict[str, Any]) -> bool:
+        """Send webhook payload and return whether Feishu accepted it."""
         attempt = 0
         max_attempts = self._config.retry.max_retries + 1
         last_error: Exception | None = None
@@ -55,7 +55,7 @@ class WebhookSender:
             try:
                 async with session.post(webhook_url, json=payload, proxy=self._config.proxy_url) as resp:
                     if resp.status == WEBHOOK_SUCCESS_STATUS_CODE:
-                        return
+                        return True
                     is_transient_status = resp.status >= HTTP_SERVER_ERROR or resp.status == HTTP_TOO_MANY_REQUESTS
                     if is_transient_status and attempt < max_attempts:
                         log_warning(
@@ -64,7 +64,7 @@ class WebhookSender:
                         await asyncio.sleep(self._config.retry.base_delay_seconds * (2 ** (attempt - 1)))
                         continue
                     log_error(f"Webhook failed: {resp.status}")
-                    return
+                    return False
             except (aiohttp.ClientError, TimeoutError, OSError) as exc:
                 last_error = exc
                 if attempt < max_attempts:
@@ -75,6 +75,7 @@ class WebhookSender:
 
         if last_error is not None:
             log_error(f"Webhook error: {last_error}")
+        return False
 
     async def close(self) -> None:
         """Close shared webhook session."""

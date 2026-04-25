@@ -20,7 +20,6 @@ from hyperliquid import MarketGateway
 from hyperliquid.rest_client import (
     HyperliquidREST,
     get_cached_klines,
-    get_price_decimals,
     update_cache,
 )
 from indicators import (
@@ -38,8 +37,6 @@ from notifications import (
     RECONNECT_ELAPSED_NOTIFY_THRESHOLD_SECONDS,
     AlertEvent,
     WebhookSender,
-    format_connection_failed_message,
-    format_connection_success_message,
     format_directional_signal_message,
     format_ws_data_resumed_message,
     format_ws_data_silence_message,
@@ -49,7 +46,19 @@ from notifications import (
 )
 from service.alert_dispatcher import AlertDispatcher
 from service.market_data_processor import MarketDataProcessor
+from service.notification_lifecycle import NotificationLifecycleManager
+from service.notification_orchestration import (
+    NotificationInitializationOrchestrator,
+    NotificationRunOrchestrator,
+)
+from service.runtime_symbol_utils import (
+    cleanup_symbol_state,
+    get_pair_components,
+    is_pair_trading_symbol,
+    parse_pair_components,
+)
 from service.signal_coordinator import SignalCoordinator
+from service.state import RuntimeState
 from service.ws_runtime_supervisor import WSRuntimeSupervisor
 from signals import (
     recalculate_states,
@@ -57,6 +66,7 @@ from signals import (
     start_breakout_monitor,
     update_klines,
 )
+from signals.state import get_atr_channel_state, normalize_trailing_stop_state, set_atr_channel_state
 
 logger = get_logger(__name__)
 
@@ -177,11 +187,7 @@ class NotificationService:
         sym_config = self.config.get("symbols", {})
         self.single_list: list[str] = sym_config.get("single_list", [])
         self.pair_list: list[str] = sym_config.get("pair_list", [])
-        self._pair_components: dict[str, tuple[str, str]] = {}
-        for p in self.pair_list:
-            if "-" in p:
-                parts = p.split("-", 1)
-                self._pair_components[p] = (parts[0], parts[1])
+        self._pair_components: dict[str, tuple[str, str]] = parse_pair_components(self.pair_list)
         self.symbols: list[str] = self.single_list + self.pair_list
         self.webhook_url = self.config["webhook"]["url"]
         self.webhook_format = self.config["webhook"].get("format", "card")
@@ -229,23 +235,24 @@ class NotificationService:
         exchange_id = self.config.get("settings", {}).get("exchange", "binance")
         self._exchange_id = exchange_id
 
-        self.mark_prices: dict[str, float] = {}
-        self.mark_price_times: dict[str, float] = {}
+        self.runtime_state = RuntimeState()
+        self.mark_prices = self.runtime_state.mark_prices
+        self.mark_price_times = self.runtime_state.mark_price_times
         self._breakout_comp_prices: dict[str, float] = {}
         self.kline_cache: dict[str, list[Any]] = {}
         self.kline_cache_4h: dict[str, list[Kline]] = {}
         self.kline_cache_15m: dict[str, list[Kline]] = {}
-        self.benchmark: dict[str, dict[str, Any]] = {}
+        self.benchmark = self.runtime_state.benchmark
         self.last_st_state: dict[str, str] = {}
-        self.last_atr_state: dict[str, dict[str, Any]] = {}
-        self.last_atr4h_state: dict[str, dict[str, Any]] = {}
-        self.last_alert_time: dict[str, float] = {}
+        self.last_atr_state = self.runtime_state.last_atr_state
+        self.last_atr4h_state = self.runtime_state.last_atr4h_state
+        self.last_alert_time = self.runtime_state.last_alert_time
         self.last_kline_time: dict[str, int] = {}
-        self.breakout_monitor: dict[str, dict[str, Any]] = {}
-        self.trailing_stop: dict[str, dict[str, Any]] = {}
+        self.breakout_monitor = self.runtime_state.breakout_monitor
+        self.trailing_stop = self.runtime_state.trailing_stop
         self.last_atr1h_ch: dict[str, int] = {}
         self.clustering_states: dict[str, Any] = {}
-        self.last_clustering_state: dict[str, dict[str, Any]] = {}
+        self.last_clustering_state = self.runtime_state.last_clustering_state
         self.connected = False
         self.running = False
         self.observer: Any | None = None
@@ -350,6 +357,10 @@ class NotificationService:
             enqueue_payload_fn=lambda data: self._enqueue_ws_payload(data),
             process_payload_fn=lambda data: self._market_data_processor.process_payload(data),
         )
+        self._lifecycle_manager = NotificationLifecycleManager(self)
+        self._initialization_orchestrator = NotificationInitializationOrchestrator(self)
+        self._ready_summary_orchestrator = self._initialization_orchestrator
+        self._run_orchestrator = NotificationRunOrchestrator(self)
 
     def _touch_heartbeat_file(self) -> None:
         """Persist a lightweight heartbeat timestamp for external monitors."""
@@ -448,7 +459,8 @@ class NotificationService:
 
     def _cleanup_symbol_state(self, symbol: str) -> None:
         """Remove symbol-scoped runtime state to avoid stale data retention."""
-        for mapping in (
+        cleanup_symbol_state(
+            symbol,
             self.mark_prices,
             self.mark_price_times,
             self.kline_cache,
@@ -467,16 +479,8 @@ class NotificationService:
             self._last_atr_refresh_attempt,
             self._last_atr4h_refresh_attempt,
             self._last_trailing_refresh_attempt,
-        ):
-            mapping.pop(symbol, None)
-
-        for alert_key in (
-            f"ATR_Ch_{symbol}",
-            f"ATR_4H_{symbol}",
-            f"ClusterST_{symbol}",
-            symbol,
-        ):
-            self.last_alert_time.pop(alert_key, None)
+            alert_times=self.last_alert_time,
+        )
 
     def _prune_runtime_state(self) -> None:
         """Prune stale symbol state that no longer belongs to configured symbols."""
@@ -686,16 +690,16 @@ class NotificationService:
             return
 
         now = time.time()
-        prev_state = self.last_atr4h_state.get(symbol, {"ch": 0, "sent": None})
+        prev_state = get_atr_channel_state(self.last_atr4h_state, symbol)
         natr_raw = bm.get("atr4h_natrr", 0)
         natr = (natr_raw / current_price * 100) if current_price > 0 and natr_raw > 0 else None
         alert_key = f"ATR_4H_{symbol}"
 
-        if current_price >= atr_upper and prev_state["ch"] != 1:
+        if current_price >= atr_upper and prev_state.ch != 1:
             last_alert = self.last_alert_time.get(alert_key, 0)
             if now - last_alert > ATR_BREAKOUT_COOLDOWN_SECONDS:
                 self.last_alert_time[alert_key] = now
-                self.last_atr4h_state[symbol] = {"ch": 1, "sent": "LONG"}
+                set_atr_channel_state(self.last_atr4h_state, symbol, 1, "LONG")
                 await self._send_webhook(
                     ALERT_ATR_CHANNEL,
                     format_directional_signal_message(symbol, DIRECTION_LONG, "4H"),
@@ -710,11 +714,11 @@ class NotificationService:
                     },
                 )
                 self._increment_alert_count()
-        elif current_price <= atr_lower and prev_state["ch"] != -1:
+        elif current_price <= atr_lower and prev_state.ch != -1:
             last_alert = self.last_alert_time.get(alert_key, 0)
             if now - last_alert > ATR_BREAKOUT_COOLDOWN_SECONDS:
                 self.last_alert_time[alert_key] = now
-                self.last_atr4h_state[symbol] = {"ch": -1, "sent": "SHORT"}
+                set_atr_channel_state(self.last_atr4h_state, symbol, -1, "SHORT")
                 await self._send_webhook(
                     ALERT_ATR_CHANNEL,
                     format_directional_signal_message(symbol, DIRECTION_SHORT, "4H"),
@@ -750,7 +754,11 @@ class NotificationService:
     async def _refresh_trailing_stop_channel(self, symbol: str, force: bool = False) -> None:
         """Refresh ATR trailing stop lines from full 15m history."""
         ts = self.trailing_stop.get(symbol)
-        if not ts or not ts.get("active") or ts.get("use_clustering_ts"):
+        if not ts:
+            return
+        ts = normalize_trailing_stop_state(ts)
+        self.trailing_stop[symbol] = ts
+        if not ts.active or ts.use_clustering_ts:
             return
         expected_open_time = self._expected_closed_open_time_ms(900)
         cached = self.kline_cache_15m.get(symbol, [])
@@ -771,19 +779,19 @@ class NotificationService:
         atr = calculate_atr(high, low, close, self.atr15m_period, self.atr15m_ma_type)
         prev_state = (float("nan"), float("nan"), 0)
         for i in range(len(close)):
-            upper, lower, ch = run_atr_channel(close[i], atr[i], float(ts["atr_mult"]), prev_state)
+            upper, lower, ch = run_atr_channel(close[i], atr[i], float(ts.atr_mult), prev_state)
             prev_state = (upper, lower, ch)
-        ts["atr15m_upper"] = prev_state[0]
-        ts["atr15m_lower"] = prev_state[1]
-        ts["atr15m_state"] = prev_state
+        ts.atr15m_upper = prev_state[0]
+        ts.atr15m_lower = prev_state[1]
+        ts.atr15m_state = prev_state
 
     def _is_pair_trading(self, symbol: str) -> bool:
         """Check if symbol is part of any pair (e.g. BTC in BTC-ETH -> True)."""
-        return any(symbol in comp for comp in self._pair_components.values())
+        return is_pair_trading_symbol(symbol, self._pair_components)
 
     def _get_pair_for_symbol(self, symbol: str) -> tuple[str, str] | None:
         """Get components for a pair symbol (e.g. BTC-ETH -> (BTC, ETH))."""
-        return self._pair_components.get(symbol)
+        return get_pair_components(symbol, self._pair_components)
 
     def _is_pair_symbol(self, symbol: str) -> bool:
         """Check if symbol is a pair symbol itself (e.g. BTC-ETH -> True, BTC -> False)."""
@@ -822,14 +830,7 @@ class NotificationService:
 
     async def connect(self) -> None:
         """Connect WebSocket and subscribe to all trading pairs."""
-        try:
-            await self._check_hyperliquid_connection()
-            await self._connect_hyperliquid_ws()
-            self.connected = True
-            await self._send_webhook(ALERT_SYSTEM, format_connection_success_message(self._exchange_id))
-        except Exception as e:
-            await self._send_webhook(ALERT_ERROR, format_connection_failed_message(e))
-            raise
+        await self._lifecycle_manager.connect()
 
     async def _check_hyperliquid_connection(self) -> None:
         """Check Hyperliquid REST API connectivity with retry."""
@@ -894,33 +895,7 @@ class NotificationService:
 
     async def _reconnect_hyperliquid_ws(self, reason: str) -> bool:
         """Reconnect Hyperliquid websocket with exponential backoff."""
-        self.connected = False
-        delay = self.network.ws.reconnect_base_delay_seconds
-        attempt = 0
-        started_at = time.time()
-
-        while self._hl_ws_running:
-            attempt += 1
-            elapsed = time.time() - started_at
-            await self._notify_ws_reconnect_failure(reason, attempt)
-            if attempt == 1 and elapsed <= RECONNECT_ELAPSED_NOTIFY_THRESHOLD_SECONDS:
-                logger.info("Hyperliquid WS reconnected instantly (%s, attempt %s, %.1fs)", reason, attempt, elapsed)
-            else:
-                logger.warning("Hyperliquid WS reconnecting (%s), attempt %s", reason, attempt)
-            try:
-                await self._close_hyperliquid_ws()
-                await self._connect_hyperliquid_ws(start_watch_task=False)
-                self.connected = True
-                await self._notify_ws_reconnect_success(reason, attempt, elapsed)
-                return True
-            except Exception as e:
-                logger.warning("Hyperliquid WS reconnect failed on attempt %s: %s", attempt, e)
-                if not self._hl_ws_running:
-                    return False
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, self.network.ws.reconnect_max_delay_seconds)
-
-        return False
+        return await self._lifecycle_manager.reconnect_hyperliquid_ws(reason)
 
     async def _connect_hyperliquid_ws(self, start_watch_task: bool = True) -> None:
         """Connect to Hyperliquid native WebSocket for mark prices."""
@@ -1165,53 +1140,9 @@ class NotificationService:
             self.debug,
         )
 
-    async def initialize(self) -> None:  # noqa: PLR0912
+    async def initialize(self) -> None:
         """Initialize service: fetch all K-lines and calculate indicators."""
-        logger.info(f"Initializing klines for {len(self.symbols)} symbols...")
-        self._initialized = False
-        self._prune_runtime_state()
-
-        await self.market_gateway.fetch_meta()
-
-        for symbol in self.single_list:
-            await self._ct_update_klines(symbol)
-            klines = self.kline_cache.get(symbol, [])
-            if klines:
-                self.mark_prices[symbol] = float(klines[-1].close)
-
-        for symbol in self.pair_list:
-            await self._ct_update_klines(symbol)
-            pair = self._get_pair_for_symbol(symbol)
-            if pair:
-                c1, c2 = pair
-                klines1 = self.kline_cache.get(c1, [])
-                klines2 = self.kline_cache.get(c2, [])
-                if klines1 and c1 not in self.mark_prices:
-                    self.mark_prices[c1] = float(klines1[-1].close)
-                if klines2 and c2 not in self.mark_prices:
-                    self.mark_prices[c2] = float(klines2[-1].close)
-                p1 = self.mark_prices.get(c1, 0)
-                p2 = self.mark_prices.get(c2, 0)
-                if p1 > 0 and p2 > 0:
-                    self.mark_prices[symbol] = p1 / p2
-
-        for symbol in self.single_list:
-            await self._recalculate_states(symbol)
-            await self._recalculate_4h_breakout_state(symbol)
-        for symbol in self.pair_list:
-            if self._use_clustering_for_symbol(symbol):
-                await self._ct_recalculate_states_clustering(symbol)
-            else:
-                await self._recalculate_states(symbol)
-                await self._recalculate_4h_breakout_state(symbol)
-
-        for symbol in self.single_list:
-            self._log_symbol_state(symbol)
-        for symbol in self.pair_list:
-            self._log_symbol_state(symbol)
-
-        self._initialized = True
-        logger.info("Initialization complete")
+        await self._initialization_orchestrator.initialize()
 
     def _log_symbol_state(self, symbol: str) -> None:
         """Log current state of a symbol."""
@@ -1243,84 +1174,15 @@ class NotificationService:
 
     async def _send_initial_state_summary(self) -> None:
         """Send initial state summary for all symbols after initialization."""
-        lines: list[str] = []
-        for sym in self.symbols:
-            is_pair = self._is_pair_symbol(sym)
-            price = self.mark_prices.get(sym, 0)
-            if price <= 0:
-                klines = self.kline_cache.get(sym, [])
-                if klines:
-                    price = float(klines[-1].close)
-            bm = self.benchmark.get(sym, {})
-            atr_ch = bm.get("atr1h_ch", 0)
-            atr_upper = bm.get("atr1h_upper", 0)
-            atr_lower = bm.get("atr1h_lower", 0)
-            atr_natrr = bm.get("atr1h_natrr", 0)
-
-            if atr_ch == 1:
-                atr_dir = "LONG"
-            elif atr_ch == -1:
-                atr_dir = "SHORT"
-            else:
-                atr_dir = "NEUTRAL"
-
-            if price <= 0:
-                logger.info(
-                    f"[{sym}] ATR_Ch={atr_dir} | Range=[{atr_lower:.4f}, {atr_upper:.4f}] | Waiting for WS price..."
-                )
-                continue
-
-            pd_val = get_price_decimals(sym)
-
-            if price > 0 and atr_natrr > 0:
-                natr = (atr_natrr / price) * 100
-                natr_str = f"NATR {natr:.2f}%"
-            else:
-                natr_str = "NATR N/A"
-
-            if is_pair:
-                st_state = self.last_st_state.get(sym, "neutral")
-                lines.append(
-                    f"{sym} | {atr_dir}@{price:.{pd_val}f} | ATR_Ch[{atr_upper:.{pd_val}f}, {atr_lower:.{pd_val}f}] | {natr_str} | ST:{st_state}"
-                )
-            else:
-                lines.append(
-                    f"{sym} | {atr_dir}@{price:.{pd_val}f} | ATR_Ch[{atr_upper:.{pd_val}f}, {atr_lower:.{pd_val}f}] | {natr_str}"
-                )
-
-        msg = "READY\n" + "\n".join(lines)
-        await self._send_webhook(ALERT_SYSTEM, msg)
+        await self._initialization_orchestrator.send_ready_summary()
 
     async def run(self) -> None:
         """Main service run loop."""
-        self.running = True
-        await self.initialize()
-        await self.connect()
-        await asyncio.sleep(2)
-        await self._send_initial_state_summary()
-        try:
-            while self.running:
-                await asyncio.sleep(1)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            logger.info("Received shutdown signal, stopping service...")
-            await self.stop()
+        await self._run_orchestrator.run()
 
     async def stop(self) -> None:
         """Stop service."""
-        self.running = False
-        self._hl_ws_running = False
-        for task in self._ws_tasks:
-            if not task.done():
-                task.cancel()
-        if self._ws_tasks:
-            await asyncio.gather(*self._ws_tasks, return_exceptions=True)
-            self._ws_tasks.clear()
-        await self._close_hyperliquid_ws()
-        await self._webhook_sender.close()
-        if self.observer:
-            self.observer.stop()
-            self.observer.join()
-        logger.info("Service stopped")
+        await self._lifecycle_manager.stop()
 
     def warn(self, msg: str, context: str = "") -> None:
         """Send warning log (no Feishu push)."""

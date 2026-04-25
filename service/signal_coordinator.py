@@ -15,6 +15,7 @@ from signals import (
     check_trailing_stop,
     start_breakout_monitor,
 )
+from signals.state import get_breakout_monitor_state, get_trailing_stop_state
 
 
 class SignalCoordinator:
@@ -25,13 +26,13 @@ class SignalCoordinator:
         mark_prices: dict[str, float],
         mark_price_times: dict[str, float],
         benchmark: dict[str, dict[str, Any]],
-        trailing_stop: dict[str, dict[str, Any]],
-        last_atr_state: dict[str, dict[str, Any]],
-        last_clustering_state: dict[str, dict[str, Any]],
+        trailing_stop: Any,
+        last_atr_state: Any,
+        last_clustering_state: Any,
         last_alert_time: dict[str, float],
         last_st_state: dict[str, Any],
         clustering_states: dict[str, Any],
-        breakout_monitor: dict[str, dict[str, Any]],
+        breakout_monitor: Any,
         kline_cache_15m: dict[str, list[Kline]],
         send_webhook_fn: Callable[[str, str, dict[str, Any] | None], Awaitable[None]],
         increment_alert_count_fn: Callable[[], None],
@@ -122,7 +123,8 @@ class SignalCoordinator:
 
     async def check_signals(self, symbol: str, initialized: bool) -> None:
         """Run ATR signal checks and breakout monitor bootstrap."""
-        had_active_trailing = bool(self.trailing_stop.get(symbol, {}).get("active"))
+        trailing_state = get_trailing_stop_state(self.trailing_stop, symbol)
+        had_active_trailing = bool(trailing_state.active) if trailing_state else False
         await check_signals(
             symbol,
             self.mark_prices,
@@ -143,12 +145,13 @@ class SignalCoordinator:
             self.increment_alert_count_fn,
             self.send_event_fn,
         )
-        has_new_atr_trailing = bool(self.trailing_stop.get(symbol, {}).get("active")) and not bool(
-            self.trailing_stop.get(symbol, {}).get("use_clustering_ts")
-        )
+        current_trailing = get_trailing_stop_state(self.trailing_stop, symbol)
+        if current_trailing is None:
+            return
+        has_new_atr_trailing = bool(current_trailing.active) and not bool(current_trailing.use_clustering_ts)
         if not had_active_trailing and has_new_atr_trailing:
             await self.refresh_trailing_stop_channel_fn(symbol, True)
-            direction = self.trailing_stop.get(symbol, {}).get("direction", "")
+            direction = current_trailing.direction
             if direction == DIRECTION_LONG:
                 await self.start_breakout_monitor_fn(
                     symbol, self.breakout_direction_long, self.mark_prices.get(symbol, 0), time.time()
@@ -204,15 +207,15 @@ class SignalCoordinator:
             fetch_pair_klines_fn=self.fetch_pair_klines_fn,
             proxy=proxy,
         )
-        monitor = self.breakout_monitor.get(symbol)
+        monitor = get_breakout_monitor_state(self.breakout_monitor, symbol)
         if monitor:
-            history = monitor.get("klines_15m", [])
-            if isinstance(history, list) and history:
+            history = monitor.klines_15m
+            if history:
                 self.kline_cache_15m[symbol] = history
 
     def sync_breakout_monitor_from_cache(self, symbol: str) -> None:
         """Advance breakout monitor using cached 15m bars refreshed elsewhere."""
-        monitor = self.breakout_monitor.get(symbol)
+        monitor = get_breakout_monitor_state(self.breakout_monitor, symbol)
         if not monitor:
             return
 
@@ -220,9 +223,9 @@ class SignalCoordinator:
         if len(cached_klines) < self.min_trailing_klines:
             return
 
-        monitor_klines = monitor.get("klines_15m", [])
-        if not isinstance(monitor_klines, list) or not monitor_klines:
-            monitor["klines_15m"] = cached_klines[-20:]
+        monitor_klines = monitor.klines_15m
+        if not monitor_klines:
+            monitor.klines_15m = cached_klines[-20:]
             return
 
         latest_known_open = int(monitor_klines[-1].open_time)
@@ -231,14 +234,14 @@ class SignalCoordinator:
             return
 
         updated_klines = [*monitor_klines, *newer_bars]
-        monitor["klines_15m"] = updated_klines[-20:]
-        monitor["kline_15m_count"] = int(monitor.get("kline_15m_count", 0)) + len(newer_bars)
+        monitor.klines_15m = updated_klines[-20:]
+        monitor.kline_15m_count = int(monitor.kline_15m_count) + len(newer_bars)
 
     async def check_breakout(self, symbol: str) -> None:
         """Run breakout evaluation after syncing cached runtime 15m bars."""
         self.sync_breakout_monitor_from_cache(symbol)
-        monitor = self.breakout_monitor.get(symbol)
-        if monitor and int(monitor.get("kline_15m_count", 0)) <= 0:
+        monitor = get_breakout_monitor_state(self.breakout_monitor, symbol)
+        if monitor and int(monitor.kline_15m_count) <= 0:
             return
         await check_breakout(
             symbol,

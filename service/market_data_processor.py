@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class MarketDataProcessor:
@@ -67,10 +70,28 @@ class MarketDataProcessor:
         updated_symbols = self._update_symbol_prices(mids)
 
         for symbol in updated_symbols:
-            await self._process_updated_symbol(symbol)
+            try:
+                await self._process_updated_symbol(symbol)
+            except Exception as exc:
+                logger.warning(
+                    "[market_data_processor] symbol=%s stage=updated_symbol reason=%s",
+                    symbol,
+                    exc,
+                    exc_info=True,
+                )
 
         for pair_symbol, (left, right) in self._pair_components_fn().items():
-            await self._process_pair_symbol(pair_symbol, left, right)
+            try:
+                await self._process_pair_symbol(pair_symbol, left, right)
+            except Exception as exc:
+                logger.warning(
+                    "[market_data_processor] symbol=%s stage=pair_symbol left=%s right=%s reason=%s",
+                    pair_symbol,
+                    left,
+                    right,
+                    exc,
+                    exc_info=True,
+                )
 
         return True
 
@@ -81,16 +102,32 @@ class MarketDataProcessor:
 
         for symbol in self._symbols_fn():
             if symbol in mids:
-                self._mark_prices[symbol] = float(mids[symbol])
-                self._mark_price_times[symbol] = now
-                updated_symbols.add(symbol)
+                try:
+                    self._mark_prices[symbol] = float(mids[symbol])
+                    self._mark_price_times[symbol] = now
+                    updated_symbols.add(symbol)
+                except (TypeError, ValueError) as exc:
+                    logger.warning(
+                        "[market_data_processor] symbol=%s stage=parse_price reason=%s",
+                        symbol,
+                        exc,
+                        exc_info=True,
+                    )
 
         for left, right in self._pair_components_fn().values():
             for component in (left, right):
                 if component in mids and component not in updated_symbols:
-                    self._mark_prices[component] = float(mids[component])
-                    self._mark_price_times[component] = now
-                    updated_symbols.add(component)
+                    try:
+                        self._mark_prices[component] = float(mids[component])
+                        self._mark_price_times[component] = now
+                        updated_symbols.add(component)
+                    except (TypeError, ValueError) as exc:
+                        logger.warning(
+                            "[market_data_processor] symbol=%s stage=parse_pair_component reason=%s",
+                            component,
+                            exc,
+                            exc_info=True,
+                        )
 
         return updated_symbols
 
@@ -125,6 +162,10 @@ class MarketDataProcessor:
         if left_price <= 0 or right_price <= 0:
             return
 
+        # Design note: pair price requires fresh data from both legs.
+        if not self._is_pair_fresh(left, right):
+            return
+
         now = time.time()
         pair_price = left_price / right_price
         self._mark_prices[pair_symbol] = pair_price
@@ -147,3 +188,10 @@ class MarketDataProcessor:
             await self._check_signals_4h_fn(pair_symbol)
 
         await self._check_breakout_fn(pair_symbol)
+
+    def _is_pair_fresh(self, left: str, right: str, freshness_seconds: int = 300) -> bool:
+        """Return whether both pair legs were updated within the freshness window."""
+        now = time.time()
+        left_age = now - self._mark_price_times.get(left, 0)
+        right_age = now - self._mark_price_times.get(right, 0)
+        return left_age <= freshness_seconds and right_age <= freshness_seconds

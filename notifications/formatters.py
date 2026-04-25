@@ -1,11 +1,7 @@
-"""
-Notification formatting module - pure formatting utilities, no network or file I/O.
-
-Main functions:
-- format_number: Format floating point numbers to appropriate decimal places
-"""
+"""Notification formatting module - pure formatting utilities, no network or file I/O."""
 
 import math
+from typing import Any
 
 
 def format_number(value: float) -> str:
@@ -35,3 +31,16 @@ def format_number(value: float) -> str:
     decimal_places = max(0, 8 - int_digits)
     formatted = f"{value:.{decimal_places}f}"
     return formatted.rstrip("0").rstrip(".")
+
+
+def render_value(value: Any) -> str:
+    """Render a payload value for webhook output without forcing upstream stringification."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "YES" if value else "NO"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return format_number(value)
+    return str(value)

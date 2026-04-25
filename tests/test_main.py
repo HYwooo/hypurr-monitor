@@ -1,6 +1,7 @@
 """Tests for main process helpers."""
 
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -117,8 +118,10 @@ def test_get_runtime_paths_reads_heartbeat_from_config(tmp_path: Path) -> None:
 
 def test_cleanup_old_logs_parses_iso_timestamp(tmp_path: Path) -> None:
     webhook_log = tmp_path / "webhook.log"
+    keep_ts = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+    drop_ts = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S+0000")
     webhook_log.write_text(
-        "[2026-04-14T12:00:00+0800] [SYSTEM] keep\n[2000-01-01T00:00:00+0800] [SYSTEM] drop\n",
+        f"[{keep_ts}] [SYSTEM] keep\n[{drop_ts}] [SYSTEM] drop\n",
         encoding="utf-8",
     )
 

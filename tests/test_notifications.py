@@ -187,10 +187,10 @@ class TestBuildFeishuCard:
             {
                 "symbol": "BTCETH",
                 "direction": "long",
-                "price": "16.5",
-                "ts": "16.4",
-                "perf_ama": "16.35",
-                "target_factor": "2.5",
+                "price": 16.5,
+                "ts": 16.4,
+                "perf_ama": 16.35,
+                "target_factor": 2.5,
             },
             "2026-04-03T12:00:00+0800",
         )
@@ -213,6 +213,24 @@ class TestBuildFeishuCard:
         """extra=None should be handled gracefully."""
         card = build_feishu_card("SYSTEM", "msg", None, "2026-04-03T12:00:00+0800")
         assert card["header"]["template"] == "blue"
+
+    def test_breakout_uses_rendered_bool_and_numbers(self) -> None:
+        """BREAKOUT cards should render native numeric/bool payload fields cleanly."""
+        card = build_feishu_card(
+            "BREAKOUT",
+            "[BTC] BREAKOUT",
+            {
+                "symbol": "BTC",
+                "direction": "long",
+                "confirmed": True,
+                "price": 52000.0,
+                "trigger": 52000.0,
+            },
+            "2026-04-03T12:00:00+0800",
+        )
+        elements_text = " ".join(str(e) for e in card["elements"])
+        assert "YES" not in elements_text
+        assert "52000" in elements_text
 
 
 class TestSendWebhook:
@@ -333,6 +351,15 @@ class TestSendWebhook:
 
         assert log_path.read_text(encoding="utf-8") == "b\nc\n"
 
+    def test_rotate_webhook_log_if_needed_can_clear_file(self, tmp_path: Any) -> None:
+        """Rotation should safely clear the file when max lines is zero."""
+        log_path = tmp_path / "custom.log"
+        log_path.write_text("a\n", encoding="utf-8")
+
+        _rotate_webhook_log_if_needed(str(log_path), max_log_lines=0)
+
+        assert log_path.read_text(encoding="utf-8") == ""
+
     @pytest.mark.asyncio
     async def test_webhook_sender_reuses_single_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """WebhookSender should reuse one aiohttp session across sends."""
@@ -383,6 +410,86 @@ class TestSendWebhook:
         assert len(created_sessions) == 1
         assert created_sessions[0].post_calls == 2
         assert created_sessions[0].closed is True
+
+    @pytest.mark.asyncio
+    async def test_webhook_sender_returns_success_and_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """WebhookSender should expose transport success and failure as booleans."""
+        responses = [200, 500]
+
+        class FakeResponse:
+            def __init__(self, status: int) -> None:
+                self.status = status
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> None:
+                _ = (exc_type, exc, tb)
+
+        class FakeSession:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                _ = (args, kwargs)
+                self.closed = False
+
+            def post(self, *args: Any, **kwargs: Any) -> FakeResponse:
+                _ = (args, kwargs)
+                return FakeResponse(responses.pop(0))
+
+            async def close(self) -> None:
+                self.closed = True
+
+        monkeypatch.setattr("notifications.webhook_sender.aiohttp.ClientSession", FakeSession)
+        sender = WebhookSender(
+            WebhookNetworkConfig(
+                proxy_url=None,
+                timeout_seconds=5.0,
+                retry=RetryConfig(max_retries=0, base_delay_seconds=0.1),
+            )
+        )
+
+        assert await sender.send_json("https://example.com/hook", {"msg_type": "text"}) is True
+        assert await sender.send_json("https://example.com/hook", {"msg_type": "text"}) is False
+
+    @pytest.mark.asyncio
+    async def test_send_alert_event_returns_delivery_status(self, tmp_path: Any) -> None:
+        """send_alert_event should surface sender result to callers."""
+        event = build_alert_event("SYSTEM", "delivery status")
+        sender = AsyncMock()
+        sender.send_json.return_value = True
+
+        ok = await send_alert_event(
+            "https://example.com/hook",
+            "text",
+            event,
+            log_file_path=str(tmp_path / "hook.log"),
+            get_timestamp_fn=lambda: "2026-04-14T12:00:00+0800",
+            sender=sender,
+        )
+
+        sender.send_json.assert_awaited_once()
+        assert ok.attempted is True
+        assert ok.sent is True
+        assert ok.failed is False
+
+        sender.send_json.return_value = False
+        failed = await send_alert_event(
+            "https://example.com/hook",
+            "text",
+            event,
+            log_file_path=str(tmp_path / "hook2.log"),
+            get_timestamp_fn=lambda: "2026-04-14T12:00:00+0800",
+            sender=sender,
+        )
+        assert failed.attempted is True
+        assert failed.sent is False
+        assert failed.failed is True
 
 
 class TestAlertEvent:

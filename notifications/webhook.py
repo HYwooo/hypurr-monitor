@@ -9,14 +9,26 @@ Main functions:
 """
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .alert_event import AlertEvent, build_alert_event
+from .formatters import render_value
 from .webhook_sender import WebhookSender
 
 WEBHOOK_LOG_FILE = "webhook.log"
 WEBHOOK_SUCCESS_STATUS_CODE = 200
+
+
+@dataclass(slots=True)
+class WebhookDeliveryResult:
+    """Structured webhook delivery outcome for observability."""
+
+    attempted: bool
+    sent: bool
+    failed: bool
+    deduped: bool = False
 
 
 def _get_logger() -> logging.Logger:
@@ -45,11 +57,22 @@ def _rotate_webhook_log_if_needed(log_file_path: str = WEBHOOK_LOG_FILE, max_log
         log_path = Path(log_file_path)
         if not log_path.exists():
             return
-        lines = log_path.read_text(encoding="utf-8").splitlines()
-        if len(lines) > max_log_lines:
-            log_path.write_text("\n".join(lines[-max_log_lines:]) + "\n", encoding="utf-8")
+        if max_log_lines <= 0:
+            log_path.write_text("", encoding="utf-8")
+            return
+        with log_path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) <= max_log_lines:
+            return
+        with log_path.open("w", encoding="utf-8") as f:
+            f.writelines(lines[-max_log_lines:])
     except Exception as e:
         _get_logger().warning(f"Log rotation failed: {e}")
+
+
+def _render_extra_value(extra: dict[str, Any], key: str) -> str:
+    """Render a payload field for display without mutating the payload type upstream."""
+    return render_value(extra.get(key, ""))
 
 
 def build_feishu_card(  # noqa: PLR0912, PLR0915
@@ -98,12 +121,12 @@ def build_feishu_card(  # noqa: PLR0912, PLR0915
             color = "blue"
             emoji = "\U0001f4ca"
 
-        price = extra.get("price", "")
-        atr_upper = extra.get("atr_upper", "")
-        atr_lower = extra.get("atr_lower", "")
-        stop_line = extra.get("stop_line", "")
-        entry_price = extra.get("entry_price", "")
-        timeframe = extra.get("timeframe", "")
+        price = _render_extra_value(extra, "price")
+        atr_upper = _render_extra_value(extra, "atr_upper")
+        atr_lower = _render_extra_value(extra, "atr_lower")
+        stop_line = _render_extra_value(extra, "stop_line")
+        entry_price = _render_extra_value(extra, "entry_price")
+        timeframe = _render_extra_value(extra, "timeframe")
 
         if is_trailing:
             elements = [
@@ -133,16 +156,17 @@ def build_feishu_card(  # noqa: PLR0912, PLR0915
             )
         natr = extra.get("natr")
         if natr is not None and not is_trailing:
+            natr_display = f"{float(natr):.2f}" if isinstance(natr, int | float) else render_value(natr)
             elements.append(
                 {
                     "tag": "markdown",
-                    "content": f"**NATR20:** {natr:.2f}%",
+                    "content": f"**NATR20:** {natr_display}%",
                 }
             )
         if alert_type == "ClusterST":
-            ts = extra.get("ts", "")
-            perf_ama = extra.get("perf_ama", "")
-            target_factor = extra.get("target_factor", "")
+            ts = _render_extra_value(extra, "ts")
+            perf_ama = _render_extra_value(extra, "perf_ama")
+            target_factor = _render_extra_value(extra, "target_factor")
             if ts:
                 elements.append({"tag": "markdown", "content": f"**TS:** {ts}"})
             if perf_ama:
@@ -218,7 +242,7 @@ def build_feishu_card(  # noqa: PLR0912, PLR0915
         emoji = "\U0001f4a5"
         title = f"{emoji} {symbol}"
         confirmed = extra.get("confirmed", False)
-        direction_disp = extra.get("direction", "")
+        direction_disp = render_value(extra.get("direction", ""))
         confirmed_text = "CONFIRMED" if confirmed else "FALSE"
         elements = [
             {
@@ -231,11 +255,11 @@ def build_feishu_card(  # noqa: PLR0912, PLR0915
             elements.append(
                 {
                     "tag": "markdown",
-                    "content": f"**Trigger:** {extra.get('trigger', '')}",
+                    "content": f"**Trigger:** {render_value(extra.get('trigger', ''))}",
                 }
             )
         else:
-            elements.append({"tag": "markdown", "content": f"**Reason:** {extra.get('reason', '')}"})
+            elements.append({"tag": "markdown", "content": f"**Reason:** {render_value(extra.get('reason', ''))}"})
         elements.extend(
             [
                 {"tag": "hr"},
@@ -272,7 +296,7 @@ async def send_webhook(  # noqa: PLR0913
     max_log_lines: int = 1000,
     get_timestamp_fn: Any = None,
     sender: WebhookSender | None = None,
-) -> None:
+) -> bool:
     """
     Send Feishu Webhook message.
 
@@ -292,7 +316,7 @@ async def send_webhook(  # noqa: PLR0913
         get_timestamp_fn: Timestamp getter function (optional, default returns empty)
     """
     event = build_alert_event(alert_type, message, extra)
-    await send_alert_event(
+    result = await send_alert_event(
         webhook_url,
         webhook_format,
         event,
@@ -301,6 +325,7 @@ async def send_webhook(  # noqa: PLR0913
         get_timestamp_fn=get_timestamp_fn,
         sender=sender,
     )
+    return result.sent
 
 
 def _build_log_message(event: AlertEvent) -> str:
@@ -329,19 +354,20 @@ async def send_alert_event(  # noqa: PLR0913
     max_log_lines: int = 1000,
     get_timestamp_fn: Any = None,
     sender: WebhookSender | None = None,
-) -> None:
-    """Send a structured AlertEvent through the legacy Feishu webhook path."""
+) -> WebhookDeliveryResult:
+    """Send a structured AlertEvent and return a structured delivery outcome."""
     timestamp = get_timestamp_fn() if get_timestamp_fn else ""
     full_content = f"[{timestamp}] [{event.alert_type}] {event.message}"
+    logger = _get_logger()
 
     try:
         _rotate_webhook_log_if_needed(log_file_path, max_log_lines)
         with Path(log_file_path).open("a", encoding="utf-8") as f:
             f.write(f"{full_content}\n")
     except Exception as e:
-        _get_logger().warning(f"Write webhook log failed: {e}")
+        logger.warning(f"Write webhook log failed: {e}")
 
-    _get_logger().info(_build_log_message(event))
+    logger.info(_build_log_message(event))
 
     if webhook_format == "card":
         card = build_feishu_card(event.alert_type, event.message, event.extra, timestamp)
@@ -350,8 +376,16 @@ async def send_alert_event(  # noqa: PLR0913
         msg = {"msg_type": "text", "content": {"text": full_content}}
 
     if sender is not None:
-        await sender.send_json(webhook_url, msg)
-        return
+        ok = await sender.send_json(webhook_url, msg)
+        result = WebhookDeliveryResult(attempted=True, sent=ok, failed=not ok)
+        logger.info(
+            "Webhook delivery %s | alert_type=%s | symbol=%s | dedupe_key=%s",
+            "success" if ok else "failed",
+            event.alert_type,
+            event.symbol or "",
+            event.dedupe_key or "",
+        )
+        return result
 
     import aiohttp
 
@@ -362,5 +396,26 @@ async def send_alert_event(  # noqa: PLR0913
         ):
             if resp.status != WEBHOOK_SUCCESS_STATUS_CODE:
                 log_error(f"Webhook failed: {resp.status}")
+                logger.info(
+                    "Webhook delivery failed | alert_type=%s | symbol=%s | dedupe_key=%s",
+                    event.alert_type,
+                    event.symbol or "",
+                    event.dedupe_key or "",
+                )
+                return WebhookDeliveryResult(attempted=True, sent=False, failed=True)
     except Exception as e:
         log_error(f"Webhook error: {e}")
+        logger.info(
+            "Webhook delivery failed | alert_type=%s | symbol=%s | dedupe_key=%s",
+            event.alert_type,
+            event.symbol or "",
+            event.dedupe_key or "",
+        )
+        return WebhookDeliveryResult(attempted=True, sent=False, failed=True)
+    logger.info(
+        "Webhook delivery success | alert_type=%s | symbol=%s | dedupe_key=%s",
+        event.alert_type,
+        event.symbol or "",
+        event.dedupe_key or "",
+    )
+    return WebhookDeliveryResult(attempted=True, sent=True, failed=False)
